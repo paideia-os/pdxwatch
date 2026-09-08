@@ -123,37 +123,69 @@ requires:
 # The M2 render path will add libpdx-gfx's cap-invoke pathway (no
 # extra sysno beyond the KIND_SURFACE R_SURFACE_COMMIT invocation);
 # the M3 input path will add libpdx-event's sys_ipc_recv (sysno 40).
-# The M4 semantic-pipe emit path (SysStatRecord@0.1 producer, see
-# declares_output_schemas below) will add sysno 115 (sys_semantic_
-# send) -- landed cross-repo at v1.1-B (pdxwatch #12).
+#
+# v1.1-B (pdxwatch #12, LANDED) added the SysStatRecord@0.1 producer
+# path through sys_semantic_send (sysno 115). Kernel body at
+# paideia-os/src/kernel/core/syscall/handlers/sys_semantic_send.pdx
+# (R107-M0-001 landing, paideia-os #2350; live at HEAD -- the
+# dispatch table routes sysno 115 to sys_semantic_send_body). The
+# userspace emit call lives in collect_tick's Phase D-bis (see
+# src/collectors.pdx §V1.1-B "SEMANTIC-PIPE EMIT WIRE" LANDING).
 # ---------------------------------------------------------------------
 syscalls:
 - sys_clock_read_ns @ 66
 - sys_taskinfo      @ 83
+- sys_semantic_send @ 115
 
 # ---------------------------------------------------------------------
 # Declared output schemas
 # ---------------------------------------------------------------------
 #
-# pdxwatch will emit one first-class semantic-pipe schema at v1.1-B
-# (pdxwatch #12):
+# pdxwatch emits one first-class semantic-pipe schema at v1.1-B
+# (pdxwatch #12, LANDED):
 #
-#   * SysStatRecord@0.1 -- one record per collect_tick refresh,
-#                          mirroring the CollectSnapshot struct
-#                          (num_cpus u64, per_cpu_active[8] u64,
-#                          total_cpu_ticks u64, total_rss_kb u64,
-#                          task_state_counts[8] u64 = 144B). Emitted
-#                          through sys_semantic_send (sysno 115).
-#                          Every downstream scraper (e.g. a monitoring
-#                          daemon reading `sysstat | pipe-consumer`)
-#                          consumes the same 32-byte-BLAKE3 schema
-#                          hash under the libpdx-semantic-pipe v1
-#                          contract.
+#   * SysStatRecord@0.1 -- one record per successful collect_tick
+#                          refresh. Wire shape is a byte-for-byte
+#                          prefix of the CollectSnapshot struct
+#                          starting at CollectSnapshot[+32]:
 #
-# At M1-001 the emitter path is NOT scaffolded -- collectors.pdx
-# populates the in-memory snapshot only; no envelope encoder runs.
-# The schema name is declared here so the v1.1-B landing does not
-# need to introduce it and the downstream dependency-audit tree
-# already sees pdxwatch as a SysStatRecord producer.
+#                            [+0 .. +64)   per_cpu_active[0..8]    (u64 x 8)
+#                            [+64.. +72)   total_cpu_ticks         (u64)
+#                            [+72.. +80)   total_rss_kb            (u64)
+#                            [+80..+144)   task_state_counts[0..8] (u64 x 8)
+#                            [+144..+152)  task_seen               (u64)
+#                            [+152..+160)  task_skipped            (u64)
+#
+#                          = 160 bytes total, comfortably under the
+#                          kernel's SSS_MAX_RECORD (240) cap with 80
+#                          bytes headroom for a v0.2 tail extension
+#                          (network sparkline stats, per-widget
+#                          dirty telemetry). num_cpus is NOT
+#                          emitted: the v1.1-A CollectSnapshot
+#                          hard-codes num_cpus=1 at M1-001 and the
+#                          per_cpu_active[8] slice already carries
+#                          the CPU distribution; a future v0.2 that
+#                          widens num_cpus emits it in the tail
+#                          extension rather than repacking.
+#
+#                          Emitted through sys_semantic_send
+#                          (sysno 115) with schema tag
+#                          0x41545353 ('SSTA' little-endian, per
+#                          the postui 4-char ASCII convention --
+#                          transitional until libpdx-semantic-pipe's
+#                          BLAKE3-hash schema registry lands).
+#                          Every downstream scraper (e.g. a
+#                          monitoring daemon reading
+#                          `sysstat | pipe-consumer`) filters on
+#                          this constant.
+#
+# The v1.1-A landing populated the in-memory snapshot only; v1.1-B
+# (pdxwatch #12) adds the emit call in collect_tick's Phase D-bis.
+# The emit is best-effort: sys_semantic_send failures increment a
+# cumulative counter in the CollectSnapshot reserved region
+# ([+192] emit_ok, [+200] emit_fail) so a witness can assert the
+# collector's emit path is running without a KIND_SEMANTIC_PIPE
+# consumer wired up, and the tick still commits regardless (a
+# transient emit fault does not de-sync the stats-side aggregate).
 declares_output_schemas:
 - SysStatRecord@0.1

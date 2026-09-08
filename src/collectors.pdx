@@ -1,8 +1,9 @@
 // src/collectors.pdx -- pdxwatch.M1-001 (paideia-os/pdxwatch#1)
 //                     -- v1.1-A real-body landing (pdxwatch#11)
+//                     -- v1.1-B semantic-pipe emit wire (pdxwatch#12)
 //
 // Collectors module: CollectSnapshot struct + fixed-tick sys_taskinfo
-// aggregation loop.
+// aggregation loop + SysStatRecord@0.1 semantic-pipe emit per refresh.
 //
 // =============================================================================
 // SCOPE (design/graphics/r102-user-plan.md §2.8 pdxwatch reference app)
@@ -51,6 +52,72 @@
 // (v1.1 pass) for the org-wide milestone-alignment rationale.
 //
 // =============================================================================
+// V1.1-B "SEMANTIC-PIPE EMIT WIRE" LANDING (pdxwatch#12)
+// =============================================================================
+//
+// After every successful collect_tick refresh, emit one SysStatRecord@0.1
+// record through SC+ sysno 115 (sys_semantic_send). The record is a
+// 160-byte contiguous slice of the CollectSnapshot starting at [+32]:
+//
+//   [+0 .. +64)   per_cpu_active[0..8]      (u64 x 8)
+//   [+64.. +72)   total_cpu_ticks           (u64)
+//   [+72.. +80)   total_rss_kb              (u64)
+//   [+80..+144)   task_state_counts[0..8]   (u64 x 8)
+//   [+144..+152)  task_seen                 (u64)
+//   [+152..+160)  task_skipped              (u64)
+//
+// The wire layout is deliberately a byte-for-byte prefix of the
+// in-memory CollectSnapshot fields [+32..+192], so the emit call is a
+// single `lea rsi, [rbx + 32]; mov rdx, 160; call pw_sys_semantic_send`
+// -- no marshalling buffer, no field-by-field pack, no copy. When
+// libpdx-semantic-pipe formalizes SysStatRecord@0.1's registry entry
+// this slice IS the record; the schema hash the registry publishes
+// commits to this exact 160-byte layout.
+//
+// Schema tag policy (transitional): the kernel sys_semantic_send
+// contract treats `schema` as an opaque u64 the consumer echoes back.
+// libpdx-semantic-pipe's future v1 contract (design/terminal/schema-
+// registry.md §Wire-side hash) will replace the u64 tag with the
+// 32-byte-BLAKE3 hash of the frozen schema descriptor. Until then,
+// pdxwatch uses the postui 4-char-ASCII packing convention (see
+// postui/src/semantic_registry.pdx SEMANTIC_SCHEMA_{BLKV,PGVW,...}):
+// the tag `"SSTA"` (SysSTAt) packs little-endian to 0x41545353.
+// Downstream consumers (a monitoring daemon reading `sysstat |
+// pipe-consumer`) filter on this constant; the swap to a BLAKE3-
+// derived tag will be transparent to the wire shape.
+//
+// Emit is best-effort: sys_semantic_send returns 0 on success, or
+// -EFAULT / -EINVAL on failure. Success and failure counts land in
+// the CollectSnapshot reserved region ([+192] emit_ok, [+200]
+// emit_fail) so a M4 witness can assert "the collector emitted N
+// records over K ticks" without a KIND_SEMANTIC_PIPE consumer wired
+// up. The failure counts are cumulative (Phase B does not reset the
+// reserved region -- see below), matching refresh_count's cumulative
+// shape.
+//
+// The emit call is placed AFTER the aggregate windows are populated
+// (Phase D writes task_seen / task_skipped back to memory) and
+// BEFORE last_tick / refresh_count are committed (Phase E), so:
+//
+//   - the emitted record reflects the just-completed refresh's
+//     aggregate state (including the freshly stored task_seen /
+//     task_skipped), and
+//   - the last_tick anchor captures true completion time including
+//     the emit-syscall latency, absorbing per-tick emit jitter into
+//     the next-interval accounting rather than the current one.
+//
+// The console/render fingerprint of pdxwatch is UNCHANGED at v1.1-B
+// -- the semantic pipe is an out-of-band structured emit channel,
+// not a duplicate of any surface commit or terminal write. The
+// M2-001..M2-003 widget-render landings are unaffected.
+//
+// The wire covers the same 160-byte prefix on every future v0.x
+// SysStatRecord version bump (the schema evolution adds fields at
+// the tail without repacking); a v1.0 that reshapes an existing
+// field is a schema-registry breaking change and bumps the
+// SysStatRecord tag to a new value.
+//
+// =============================================================================
 // MODULE NAME DEVIATION
 // =============================================================================
 //
@@ -67,8 +134,18 @@
 // SC+ SYSCALL DEPENDENCIES (design/user/syscall-table.md, paideia-os)
 // =============================================================================
 //
-//   * sysno 66 = sys_clock_read_ns()          -> u64 ns since boot
-//   * sysno 83 = sys_taskinfo(idx, user_buf)  -> 0 | -ENOENT | -ESRCH | -EFAULT
+//   * sysno 66  = sys_clock_read_ns()                       -> u64 ns
+//   * sysno 83  = sys_taskinfo(idx, user_buf)               -> 0 |
+//                                                              -ENOENT |
+//                                                              -ESRCH |
+//                                                              -EFAULT
+//   * sysno 115 = sys_semantic_send(schema, rec_ptr, rec_len)
+//                                                           -> 0 |
+//                                                              -EFAULT |
+//                                                              -EINVAL
+//                (v1.1-B addition; kernel body at src/kernel/core/
+//                syscall/handlers/sys_semantic_send.pdx, R107-M0-001
+//                landing paideia-os#2350; live at HEAD)
 //
 // Both syscalls ARE live at paideia-os HEAD:
 //
@@ -79,6 +156,16 @@
 //     record extension). No stub is required -- the syscall number
 //     is real and the record shape is frozen at 64 bytes per
 //     src/kernel/core/sched/task_info.pdx §Record layout.
+//
+//   - sys_semantic_send: kernel body at src/kernel/core/syscall/
+//     handlers/sys_semantic_send.pdx (R107-M0-001 landing,
+//     paideia-os#2350). 16-slot / 240-byte-record global ring keyed
+//     positionally by (head, schema). Overwrite-oldest policy at v1;
+//     PIPE_FULL never fires. pdxwatch's 160-byte SysStatRecord fits
+//     within the 240-byte per-slot data window with 80 bytes of
+//     headroom for the v0.2 tail extension (network sparkline stats
+//     bucket, per-widget dirty flag) documented under the reserved
+//     region layout below.
 //
 // pdxwatch's collectors path shares the exact syscall pair postui-
 // top's poll module uses (see paideia-os/postui-top src/poll.pdx),
@@ -176,6 +263,8 @@ module Collectors = structure {
   pub let PW_ERR_BAD_STATE_PTR         : u64 = 0xFFFFE200
   pub let PW_ERR_INTERVAL_ZERO         : u64 = 0xFFFFE201
   pub let PW_ERR_MAX_CPUS_EXCEEDED     : u64 = 0xFFFFE202
+  pub let PW_ERR_EMIT_EFAULT           : u64 = 0xFFFFE203  // v1.1-B
+  pub let PW_ERR_EMIT_EINVAL           : u64 = 0xFFFFE204  // v1.1-B
 
   // ==========================================================================
   // Kernel-side sys_taskinfo error sentinels (mirror src/kernel/core/
@@ -246,14 +335,33 @@ module Collectors = structure {
   //   [+184]  task_skipped         (u64)   count of task_pool slots
   //                                        that returned non-zero
   //                                        (ENOENT / ESRCH / EFAULT)
-  //   [+192..+255] reserved                64 bytes of growth room
+  //   [+192]  semantic_emit_ok             (u64)   v1.1-B: cumulative
+  //                                        count of successful
+  //                                        sys_semantic_send returns
+  //                                        (rax == 0). NOT reset by
+  //                                        Phase B (matches
+  //                                        refresh_count's cumulative
+  //                                        shape); zeroed only by
+  //                                        collect_init.
+  //   [+200]  semantic_emit_fail           (u64)   v1.1-B: cumulative
+  //                                        count of non-zero
+  //                                        sys_semantic_send returns
+  //                                        (any of -EFAULT / -EINVAL).
+  //                                        At v1.1-B failure is
+  //                                        best-effort observability
+  //                                        only -- the tick still
+  //                                        commits and refresh_count
+  //                                        still increments, so a
+  //                                        transient emit failure
+  //                                        does not de-sync the
+  //                                        stats-side aggregate.
+  //   [+208..+255] reserved                48 bytes of growth room
   //                                        (network sparkline bucket,
   //                                        per-widget dirty flag,
-  //                                        semantic-pipe emit failure
-  //                                        counter at v1.1-B); zeroed
-  //                                        by collect_init so an
-  //                                        M1-002+ reader can trust an
-  //                                        unset field reads as 0
+  //                                        M2 render-frame counters);
+  //                                        zeroed by collect_init so
+  //                                        an M1-002+ reader can trust
+  //                                        an unset field reads as 0
   //                                        without requiring every
   //                                        caller to pre-zero the
   //                                        struct itself
@@ -275,7 +383,45 @@ module Collectors = structure {
   pub let PW_SNAP_OFF_TASK_STATE_COUNTS    : u64 = 112
   pub let PW_SNAP_OFF_TASK_SEEN            : u64 = 176
   pub let PW_SNAP_OFF_TASK_SKIPPED         : u64 = 184
-  pub let PW_SNAP_OFF_RESERVED             : u64 = 192
+  pub let PW_SNAP_OFF_SEMANTIC_EMIT_OK     : u64 = 192  // v1.1-B
+  pub let PW_SNAP_OFF_SEMANTIC_EMIT_FAIL   : u64 = 200  // v1.1-B
+  pub let PW_SNAP_OFF_RESERVED             : u64 = 208
+
+  // ==========================================================================
+  // Semantic-pipe emit constants (v1.1-B, pdxwatch#12).
+  //
+  //   PW_SEMANTIC_RECORD_OFF   -- byte offset into CollectSnapshot at
+  //                               which the wire record begins. The
+  //                               160-byte slice [+32..+192) is emitted
+  //                               verbatim; layout matches the
+  //                               SysStatRecord@0.1 wire shape (see
+  //                               file header §V1.1-B). Bringing the
+  //                               reserved region under emit coverage
+  //                               would waste ring bandwidth and drift
+  //                               the wire shape from what v1.1-A
+  //                               already committed to memory.
+  //   PW_SEMANTIC_RECORD_BYTES -- 160. Fits comfortably under the
+  //                               kernel's SSS_MAX_RECORD (240) cap
+  //                               with 80 bytes headroom for the v0.2
+  //                               tail extension. Fits imm32; used as
+  //                               a mov rdx, imm at the emit callsite.
+  //   PW_SEMANTIC_SCHEMA_SSTA  -- 4-char ASCII 'SSTA' packed little-
+  //                               endian: 'S'|'S'|'T'|'A' -> byte 0..3
+  //                               of the u64 = 0x53, 0x53, 0x54, 0x41
+  //                               -> LE value 0x41545353. Matches the
+  //                               postui SEMANTIC_SCHEMA_<TAG>
+  //                               convention (postui/src/semantic_
+  //                               registry.pdx). Transitional -- swaps
+  //                               to the BLAKE3-derived tag when
+  //                               libpdx-semantic-pipe's schema
+  //                               registry lands.
+  //   PW_SYS_SEMANTIC_SEND     -- 115 (design/user/syscall-table.md
+  //                               row 115; R107-M0-001 landing).
+  // ==========================================================================
+  pub let PW_SEMANTIC_RECORD_OFF   : u64 = 32
+  pub let PW_SEMANTIC_RECORD_BYTES : u64 = 160
+  pub let PW_SEMANTIC_SCHEMA_SSTA  : u64 = 0x41545353
+  pub let PW_SYS_SEMANTIC_SEND     : u64 = 115
 
   // ==========================================================================
   // Task-pool iteration ceiling (matches src/kernel/core/sched/
@@ -391,6 +537,44 @@ module Collectors = structure {
     }
 
   // ==========================================================================
+  // pw_sys_semantic_send(schema, record_ptr, record_len) -> u64
+  //
+  // Thin wrapper around SC+ sysno 115 (sys_semantic_send). Copies
+  // `record_len` bytes from user VA `record_ptr` into the next slot of
+  // the kernel's fixed 16-slot / 256-byte-stride global ring, tagging
+  // the slot header with `schema` (opaque u64; the kernel does not
+  // interpret it). Overwrite-oldest ring policy at v1 -- PIPE_FULL
+  // never fires.
+  //
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle; arity 3 < 4).
+  // Leaf. Returns:
+  //   * 0                                     -- record enqueued
+  //   * 0xFFFFFFFFFFFFFFF2  (-EFAULT)         -- bad record_ptr or
+  //                                              mid-copy walker fault
+  //                                              (the pending slot's
+  //                                              previous header is
+  //                                              preserved; head is
+  //                                              NOT advanced)
+  //   * 0xFFFFFFFFFFFFFFEA  (-EINVAL)         -- record_len == 0 or
+  //                                              record_len > 240
+  //
+  // Effect row !{mem, sysreg} because the kernel reads up to 240 bytes
+  // from the caller's record_ptr. No capability (@{}) at v1 -- schema
+  // whitelisting lives in libpdx-semantic-pipe (caller-side pre-flight);
+  // the kernel's producer side takes no cap slots.
+  // ==========================================================================
+  pub let pw_sys_semantic_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.v1.1-B (pdxwatch#12): SC+ sysno 115 (sys_semantic_send) wrapper. SysV rdi=schema / rsi=record_ptr / rdx=record_len pass through unchanged to SYSCALL rdi/rsi/rdx (arity 3). mov rax, 115; syscall; ret. Kernel dispatch at src/kernel/core/syscall/dispatch.pdx routes sysno 115 to sys_semantic_send_body (R107-M0-001 landing, paideia-os#2350). Kernel body performs (1) length bounds [1, 240] -> -EINVAL, (2) user_ptr_ok(record_ptr, record_len) -> -EFAULT, (3) head := _semantic_ring_head, (4) slot base := _semantic_ring + head*256, (5) user_read_bytes_via_walk(&slot.data, record_ptr, record_len) BEFORE header commit so a mid-copy -EFAULT leaves the previous slot header intact, (6) commit header (schema @+0, len @+8), (7) advance head modulo 16, (8) return 0. Leaf: rcx/r11 SYSCALL-clobbered (SysV caller-save). Sole consumer: collect_tick's Phase D-bis emit step below. This is pdxwatch's only ring-3-to-kernel semantic-pipe entry -- every downstream schema pdxwatch adds (network sparkline windows, per-widget dirty telemetry) reuses this exact wrapper; the wire shape is schema-agnostic at the syscall boundary.",
+      block: {
+        mov rax, 115;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // collect_init(state_ptr, interval_ticks) -> u64
   //
   // Initialize a CollectSnapshot struct in caller-provided memory.
@@ -499,10 +683,20 @@ module Collectors = structure {
   //             swaps this for real cpu-affinity readout)
   //             per_cpu_active[cpu_bucket] += 1
   //         - task_seen += 1
-  //   5. Anchor last_tick at commit time (re-read sys_clock_read_ns
-  //      after the iterate step so post-iterate jitter is absorbed
-  //      into next-interval accounting), refresh_count += 1
-  //   6. Return 1
+  //   5. (v1.1-B) Emit SysStatRecord@0.1 through pw_sys_semantic_send:
+  //          schema     = PW_SEMANTIC_SCHEMA_SSTA (0x41545353)
+  //          record_ptr = &_pw_snapshot[+PW_SEMANTIC_RECORD_OFF (32)]
+  //          record_len = PW_SEMANTIC_RECORD_BYTES (160)
+  //      The record is the contiguous slice [+32..+192) of the just-
+  //      populated snapshot -- no marshalling. On rax == 0 increment
+  //      semantic_emit_ok at [+192]; on rax != 0 increment
+  //      semantic_emit_fail at [+200]. Failure is best-effort; the
+  //      tick still commits and refresh_count still increments.
+  //   6. Anchor last_tick at commit time (re-read sys_clock_read_ns
+  //      after the iterate + emit step so post-iterate + emit jitter
+  //      is absorbed into next-interval accounting), refresh_count
+  //      += 1
+  //   7. Return 1
   //
   // Register plan: 5-push callee-save prologue (rbx / r12 / r13 /
   // r14 / r15) = 40 bytes -> SysV entry rsp%16==8, +40 -> rsp%16==0.
@@ -526,7 +720,7 @@ module Collectors = structure {
   pub let collect_tick : (u64) -> u64 !{mem, sysreg} @{} =
     fn (state_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): fixed-interval task-pool aggregation entry. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=num_cpus, r13=idx, r14=task_seen, r15=task_skipped) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call. Phase A (interval gate): call pw_sys_clock_ns; shr rax, PW_TICK_SHIFT=24 (ns -> 16.7ms-tick); mov rcx, [rbx + 8] (last_tick). last_tick==0 sentinel: cmp rcx, 0; je pw_first_refresh (skip elapsed check on very first call so the documented \"first collect_tick always fires\" contract holds regardless of small early-boot now_tick values). Otherwise: sub rax, rcx (elapsed_ticks; unsigned wrap OK -- monotonic clock guarantees last_tick <= now_tick); mov rcx, [rbx + 0] (interval_ticks); cmp rax, rcx; jb pw_notyet (below = not enough elapsed). Phase B (reset the aggregate windows the iter step will accumulate into -- pw_reset_scan zeroes 8 qwords starting at [rbx + 32] (per_cpu_active), 2 qwords at [rbx + 96] (total_cpu_ticks + total_rss_kb), 8 qwords at [rbx + 112] (task_state_counts), 2 qwords at [rbx + 176] (task_seen + task_skipped). Each zero-window is a tight qword scan bounded by a compile-time immediate byte count -- no imul, no imm64). Phase C (load num_cpus): mov r12, [rbx + 24]. If num_cpus==0 (defensive; collect_init hard-codes 1 so this is dead code at M1-001 but survives a future collect_init contract change) fall back to r12=1 to avoid a divide-by-zero-shaped bucket wraparound. Phase D (iterate): xor r13, r13 (idx=0); xor r14, r14 (task_seen=0); xor r15, r15 (task_skipped=0); pw_iter_step: cmp r13, 64 (PW_MAX_TASKS); jae pw_iter_end. mov rdi, r13; lea rsi, [rip + _pw_scratch]; call pw_sys_taskinfo. cmp rax, 0; jne pw_iter_skip (non-zero -> skip slot; the -ESRCH-stops-iteration refinement is M1-002). Then extract + aggregate: (a) cpu_ticks: mov rax, [rip + _pw_scratch + 32]; mov rcx, [rbx + 96]; add rcx, rax; mov [rbx + 96], rcx (total_cpu_ticks += cpu_ticks). (b) rss_kb: mov rax, [rip + _pw_scratch + 40]; shl rax, 2 (pages -> KiB, 4KiB pages); mov rcx, [rbx + 104]; add rcx, rax; mov [rbx + 104], rcx (total_rss_kb += rss_pages<<2). (c) state bucket: mov rax, [rip + _pw_scratch + 8] (state); cmp rax, 8; jb pw_state_ok; mov rax, 7; pw_state_ok: (clamp state into [0..7]). Compute state_slot_ptr = rbx + 112 + state*8 via `mov rcx, rax; shl rcx, 3; lea rdx, [rbx + 112]; add rdx, rcx`. mov rcx, [rdx + 0]; add rcx, 1; mov [rdx + 0], rcx (task_state_counts[state] += 1). (d) per_cpu_active bucket if RUNNING: mov rax, [rip + _pw_scratch + 8]; cmp rax, 2 (PW_STATE_RUNNING); jne pw_not_running. Bucket = task_seen mod num_cpus computed via mask-when-power-of-two heuristic (M1-001 hard-codes num_cpus=1, so bucket=0 always at this landing -- the modulus is deferred to the sys_cpuinfo landing which introduces real multi-CPU affinity; for now compute bucket=0 unconditionally via xor rcx, rcx to keep the code path shaped correctly for the M2 widen). Compute cpu_slot_ptr = rbx + 32 + bucket*8 via `shl rcx, 3; lea rdx, [rbx + 32]; add rdx, rcx`. mov rcx, [rdx + 0]; add rcx, 1; mov [rdx + 0], rcx (per_cpu_active[bucket] += 1). pw_not_running: continue. (e) task_seen += 1: add r14, 1; jmp pw_iter_next. pw_iter_skip: add r15, 1. pw_iter_next: add r13, 1; jmp pw_iter_step. pw_iter_end: mov [rbx + 176], r14 (task_seen); mov [rbx + 184], r15 (task_skipped). Phase E (commit tick + refresh_count): call pw_sys_clock_ns; shr rax, 24; mov [rbx + 8], rax (last_tick). mov rax, [rbx + 16]; add rax, 1; mov [rbx + 16], rax (refresh_count += 1). Phase F (return 1): mov rax, 1; 5-pop; ret. pw_notyet: xor rax, rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (state*8 and bucket*8 use shl rcx, 3; per_cpu_active offset uses lea + add, never a runtime multiply of 8-byte stride against a runtime index that would need imul); no `and reg, imm64` (state clamp uses cmp+jb+mov rather than and rax, 7 which fits imm8 but the cmp form is more auditable); no `cmp reg, [mem]` (every compare loads through a scratch first); no `mul` mnemonic. Every immediate in cmp/shr/shl fits imm8 (0, 1, 2, 3, 7, 8, 24, 32, 40, 64, 96, 104, 112, 176, 184, 256). No byte load path in this M1-001 body (postui-top's strnlen path was reserved for the row-array shape; the aggregate shape has no per-byte scan). Labels prefixed pw_ (substring \"loop\" avoided defensively; encoder-reserved keywords never appear). Cross-module calls (pw_sys_clock_ns / pw_sys_taskinfo) are all leaf syscall wrappers per the two `pub let`s above -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A) + v1.1-B semantic-pipe emit (pdxwatch#12): fixed-interval task-pool aggregation entry with post-aggregate SysStatRecord@0.1 emit. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=num_cpus, r13=idx, r14=task_seen, r15=task_skipped) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call. Phase A (interval gate): call pw_sys_clock_ns; shr rax, PW_TICK_SHIFT=24 (ns -> 16.7ms-tick); mov rcx, [rbx + 8] (last_tick). last_tick==0 sentinel: cmp rcx, 0; je pw_first_refresh (skip elapsed check on very first call so the documented \"first collect_tick always fires\" contract holds regardless of small early-boot now_tick values). Otherwise: sub rax, rcx (elapsed_ticks; unsigned wrap OK -- monotonic clock guarantees last_tick <= now_tick); mov rcx, [rbx + 0] (interval_ticks); cmp rax, rcx; jb pw_notyet (below = not enough elapsed). Phase B (reset the aggregate windows the iter step will accumulate into -- pw_reset_scan zeroes 8 qwords starting at [rbx + 32] (per_cpu_active), 2 qwords at [rbx + 96] (total_cpu_ticks + total_rss_kb), 8 qwords at [rbx + 112] (task_state_counts), 2 qwords at [rbx + 176] (task_seen + task_skipped). Each zero-window is a tight qword scan bounded by a compile-time immediate byte count -- no imul, no imm64). Phase C (load num_cpus): mov r12, [rbx + 24]. If num_cpus==0 (defensive; collect_init hard-codes 1 so this is dead code at M1-001 but survives a future collect_init contract change) fall back to r12=1 to avoid a divide-by-zero-shaped bucket wraparound. Phase D (iterate): xor r13, r13 (idx=0); xor r14, r14 (task_seen=0); xor r15, r15 (task_skipped=0); pw_iter_step: cmp r13, 64 (PW_MAX_TASKS); jae pw_iter_end. mov rdi, r13; lea rsi, [rip + _pw_scratch]; call pw_sys_taskinfo. cmp rax, 0; jne pw_iter_skip (non-zero -> skip slot; the -ESRCH-stops-iteration refinement is M1-002). Then extract + aggregate: (a) cpu_ticks: mov rax, [rip + _pw_scratch + 32]; mov rcx, [rbx + 96]; add rcx, rax; mov [rbx + 96], rcx (total_cpu_ticks += cpu_ticks). (b) rss_kb: mov rax, [rip + _pw_scratch + 40]; shl rax, 2 (pages -> KiB, 4KiB pages); mov rcx, [rbx + 104]; add rcx, rax; mov [rbx + 104], rcx (total_rss_kb += rss_pages<<2). (c) state bucket: mov rax, [rip + _pw_scratch + 8] (state); cmp rax, 8; jb pw_state_ok; mov rax, 7; pw_state_ok: (clamp state into [0..7]). Compute state_slot_ptr = rbx + 112 + state*8 via `mov rcx, rax; shl rcx, 3; lea rdx, [rbx + 112]; add rdx, rcx`. mov rcx, [rdx + 0]; add rcx, 1; mov [rdx + 0], rcx (task_state_counts[state] += 1). (d) per_cpu_active bucket if RUNNING: mov rax, [rip + _pw_scratch + 8]; cmp rax, 2 (PW_STATE_RUNNING); jne pw_not_running. Bucket = task_seen mod num_cpus computed via mask-when-power-of-two heuristic (M1-001 hard-codes num_cpus=1, so bucket=0 always at this landing -- the modulus is deferred to the sys_cpuinfo landing which introduces real multi-CPU affinity; for now compute bucket=0 unconditionally via xor rcx, rcx to keep the code path shaped correctly for the M2 widen). Compute cpu_slot_ptr = rbx + 32 + bucket*8 via `shl rcx, 3; lea rdx, [rbx + 32]; add rdx, rcx`. mov rcx, [rdx + 0]; add rcx, 1; mov [rdx + 0], rcx (per_cpu_active[bucket] += 1). pw_not_running: continue. (e) task_seen += 1: add r14, 1; jmp pw_iter_next. pw_iter_skip: add r15, 1. pw_iter_next: add r13, 1; jmp pw_iter_step. pw_iter_end: mov [rbx + 176], r14 (task_seen); mov [rbx + 184], r15 (task_skipped). Phase D-bis (v1.1-B): emit SysStatRecord@0.1 via pw_sys_semantic_send. Sequence: mov rdi, 0x41545353 (PW_SEMANTIC_SCHEMA_SSTA -- 4-char 'SSTA' little-endian per postui SEMANTIC_SCHEMA_<TAG> convention); lea rsi, [rbx + 32] (record_ptr -- start of the per_cpu_active bucket, which is also the SysStatRecord@0.1 wire-shape origin: the 160-byte slice [+32..+192) is emitted verbatim, no marshalling); mov rdx, 160 (PW_SEMANTIC_RECORD_BYTES; fits imm32; well under kernel SSS_MAX_RECORD=240); call pw_sys_semantic_send. rax=0 -> bump [rbx + 192] (semantic_emit_ok); rax!=0 -> bump [rbx + 200] (semantic_emit_fail). Both counters are cumulative (Phase B does NOT reset the reserved region -- matches refresh_count's cumulative shape). Best-effort emit: failure does NOT skip Phase E; the tick still commits and refresh_count still increments, so a transient -EFAULT / -EINVAL does not de-sync the stats-side aggregate. r14/r15 are dead after the Phase D writes -- reused implicitly if any future revision wants to hoist counter state to registers; at v1.1-B the increment is a load-add-store through rcx (already scratch). Labels pw_emit_fail / pw_emit_done. Phase E (commit tick + refresh_count): call pw_sys_clock_ns; shr rax, 24; mov [rbx + 8], rax (last_tick). mov rax, [rbx + 16]; add rax, 1; mov [rbx + 16], rax (refresh_count += 1). Phase F (return 1): mov rax, 1; 5-pop; ret. pw_notyet: xor rax, rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (state*8 and bucket*8 use shl rcx, 3; per_cpu_active offset uses lea + add, never a runtime multiply of 8-byte stride against a runtime index that would need imul); no `and reg, imm64` (state clamp uses cmp+jb+mov rather than and rax, 7 which fits imm8 but the cmp form is more auditable); no `cmp reg, [mem]` (every compare loads through a scratch first); no `mul` mnemonic. Every immediate in cmp/shr/shl fits imm8 (0, 1, 2, 3, 7, 8, 24, 32, 40, 64, 96, 104, 112, 176, 184, 200, 256); mov-immediates that need imm32 (160, 192, 200, 0x41545353) never appear in cmp/and (fits-imm8 discipline preserved). No byte load path in this M1-001 body (postui-top's strnlen path was reserved for the row-array shape; the aggregate shape has no per-byte scan). Labels prefixed pw_ (substring \"loop\" avoided defensively; encoder-reserved keywords never appear). Cross-module calls (pw_sys_clock_ns / pw_sys_taskinfo / pw_sys_semantic_send) are all leaf syscall wrappers per the three `pub let`s above -- no additional stack pad needed at any callsite; the 5-push prologue already aligns rsp%16==0.",
       block: {
         push rbx;
         push r12;
@@ -654,6 +848,28 @@ module Collectors = structure {
         pw_iter_end:
         mov [rbx + 176], r14;                      // task_seen
         mov [rbx + 184], r15;                      // task_skipped
+
+        // ---- Phase D-bis (v1.1-B): emit SysStatRecord@0.1 -------------------
+        // Best-effort semantic-pipe emit of the just-populated aggregate
+        // slice [rbx + 32 .. rbx + 192) (160 bytes). Non-zero return
+        // bumps [rbx + 200] (semantic_emit_fail); zero return bumps
+        // [rbx + 192] (semantic_emit_ok). Rax is not propagated
+        // further; the refresh commits (Phase E) regardless.
+        mov rdi, 0x41545353;                       // PW_SEMANTIC_SCHEMA_SSTA
+        lea rsi, [rbx + 32];                       // record_ptr
+        mov rdx, 160;                              // record_len (bytes)
+        call pw_sys_semantic_send;
+        cmp rax, 0;
+        jne pw_emit_fail;
+        mov rcx, [rbx + 192];                      // semantic_emit_ok
+        add rcx, 1;
+        mov [rbx + 192], rcx;
+        jmp pw_emit_done;
+        pw_emit_fail:
+        mov rcx, [rbx + 200];                      // semantic_emit_fail
+        add rcx, 1;
+        mov [rbx + 200], rcx;
+        pw_emit_done:
 
         // ---- Phase E: commit tick + refresh_count --------------------------
         call pw_sys_clock_ns;

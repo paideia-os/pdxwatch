@@ -1,7 +1,7 @@
 # pdxwatch -- status
 
 **Wave:** R102 userland graphical stack -- reference apps
-**Current milestone:** M1-001 real-body landed (v1.1-A pass; pdxwatch#11)
+**Current milestone:** v1.1-B semantic-pipe emit wire landed (pdxwatch#12)
 **Version:** 0.1.0-pre (pre-M5 release closer)
 
 See [`paideia-os` monorepo `design/graphics/r102-user-plan.md`](https://github.com/paideia-os/paideia-os/blob/main/design/graphics/r102-user-plan.md)
@@ -23,7 +23,7 @@ issue breakdown.
 | M4-002 | Click-cycle smoke | pending M3 |
 | M4-003 | `q`-quit smoke | pending M3 |
 | M5-001 | Signed 1.0.0 release | pending M4 |
-| v1.1-B | `SysStatRecord@0.1` semantic-pipe emission wire (pdxwatch#12) | pending v1.1-A + sysno 115 kernel body (paideia-os#2352) |
+| v1.1-B | `SysStatRecord@0.1` semantic-pipe emission wire (pdxwatch#12) | **landed 2026-09-08** |
 | v1.1-C | Release closer v1.1.0 + tag (pdxwatch#13) | pending v1.1-A + v1.1-B |
 
 ## v1.1-A "real-body extraction" landing details (pdxwatch#11)
@@ -71,16 +71,54 @@ lands the real syscall path directly:
   landing time, so pdxwatch reserves headroom to 0xFFFFE2FF for
   M1-002+ growth.
 
-## Kernel-body caveat (v1.1-B pending)
+## v1.1-B "semantic-pipe emit wire" landing details (pdxwatch#12)
 
-The `SysStatRecord@0.1` semantic-pipe emit path (v1.1-B, pdxwatch#12)
-targets SC+ sysno 115 (`sys_semantic_send`). At v1.1-A the caps.decl
-forward-declares the schema and its emit transport, but the
-userspace emitter is NOT yet scaffolded. The kernel dispatch table
-DOES route sysno 115 to `_semantic_ring` at paideia-os HEAD
-(sysno 115 landing at R107-M0-001, paideia-os#2350) -- unlike
-postui-top's v1.0.0 -ENOSYS caveat, pdxwatch's v1.1-B emit path
-lands directly against a live sysno.
+Wires the `SysStatRecord@0.1` producer path through SC+ sysno 115
+(`sys_semantic_send`). Kernel body at paideia-os
+`src/kernel/core/syscall/handlers/sys_semantic_send.pdx`
+(R107-M0-001 landing, paideia-os#2350) is live at HEAD.
+
+Changes:
+
+- `src/collectors.pdx` extended with:
+  - `pw_sys_semantic_send(schema, record_ptr, record_len)` wrapper
+    for sysno 115.
+  - `PW_SEMANTIC_SCHEMA_SSTA = 0x41545353` schema tag (4-char ASCII
+    `'SSTA'` little-endian, per postui `SEMANTIC_SCHEMA_<TAG>`
+    convention; transitional until libpdx-semantic-pipe's BLAKE3-
+    hash schema registry lands).
+  - `PW_SEMANTIC_RECORD_OFF = 32` and
+    `PW_SEMANTIC_RECORD_BYTES = 160` constants naming the wire slice.
+  - `PW_SNAP_OFF_SEMANTIC_EMIT_OK  = 192` and
+    `PW_SNAP_OFF_SEMANTIC_EMIT_FAIL = 200` observability counters
+    inside the CollectSnapshot reserved region.
+  - `PW_ERR_EMIT_EFAULT / PW_ERR_EMIT_EINVAL` sentinel reservations
+    within the pdxwatch error band (unused at v1.1-B; reserved for a
+    future round that surfaces emit errors up through the M2 render
+    path).
+  - Phase D-bis emit block in `collect_tick` between the aggregate-
+    commit (Phase D) and the tick-anchor (Phase E). The emitted
+    record is the 160-byte contiguous slice `[state_ptr + 32 ..
+    state_ptr + 192)` -- byte-for-byte prefix of the CollectSnapshot
+    fields the schema names, so no marshalling buffer is needed.
+    On rax == 0 the emit_ok counter increments; on rax != 0 the
+    emit_fail counter increments; the tick still commits either way
+    (best-effort emit).
+
+- `caps.decl` `SysStatRecord@0.1` field enumeration tightened to
+  match the wire (task_seen + task_skipped added; total 160B; the
+  earlier "144B" figure was an off-by-N in the v1.1-A forward-
+  declaration). `syscalls:` block gains `sys_semantic_send @ 115`.
+
+- `manifest.pdxproj`'s speculative
+  `# - src/semantic_emit.pdx` forward-declaration retired; v1.1-B
+  keeps the emit path inside `src/collectors.pdx` (single caller,
+  no reuse surface -- extracting would fragment the round without
+  benefit).
+
+- Fingerprint: pdxwatch's console/render surface is unchanged.
+  The semantic pipe is an out-of-band structured emit channel; no
+  duplicate write of any terminal / KIND_SURFACE payload.
 
 ## Dependencies
 

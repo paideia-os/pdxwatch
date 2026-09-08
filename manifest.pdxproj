@@ -61,7 +61,15 @@ sources:
   # - src/widget_mem.pdx          # M2-002: memory tri-color widget
   # - src/widget_net.pdx          # M2-003: network sparkline widget
   # - src/input.pdx               # M3-001: click-cycle + 'q' quit input handler
-  # - src/semantic_emit.pdx       # v1.1-B: SysStatRecord@0.1 emitter via sys_semantic_send (sysno 115)
+  # v1.1-B landed the SysStatRecord@0.1 emit path INSIDE
+  # src/collectors.pdx (pw_sys_semantic_send wrapper + Phase D-bis
+  # emit block in collect_tick) rather than as a separate
+  # src/semantic_emit.pdx module -- the emit is a single call plus a
+  # two-branch counter update, tightly coupled to the just-populated
+  # snapshot, so extracting it into its own module would fragment
+  # the collect-and-publish round without adding any reuse surface
+  # (pdxwatch is the sole caller, and any downstream schema pdxwatch
+  # emits later will reuse the same in-file wrapper).
 
 # --- Library dependencies -----------------------------------------------
 # libpdx-gfx / libpdx-event / libpdx-font are the primary graphical
