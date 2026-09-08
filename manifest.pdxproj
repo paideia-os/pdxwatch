@@ -37,7 +37,7 @@
 # the same monorepo-satellite pattern.
 
 name        = pdxwatch
-version     = 1.0.0
+version     = 1.1.0
 kind        = tool
 # entry lands at M1-005 (_start binder + Main::main call). At M1-001
 # there is no _start; Main::main is the forward-declared entry that

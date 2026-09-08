@@ -1,8 +1,11 @@
 # pdxwatch -- status
 
 **Wave:** R102 userland graphical stack -- reference apps
-**Current milestone:** v1.1-B semantic-pipe emit wire landed (pdxwatch#12)
-**Version:** 0.1.0-pre (pre-M5 release closer)
+**Current milestone:** v1.1-C release closer landed (pdxwatch#13) -- **v1.1.0 released**
+**Version:** 1.1.0 (Track-C release; M5-001 v1.0.0 signed-release
+closer remains a downstream milestone -- 1.1.0 reflects the
+Track-C real-body + semantic-pipe wave landing ahead of the
+graphical-stack completion)
 
 See [`paideia-os` monorepo `design/graphics/r102-user-plan.md`](https://github.com/paideia-os/paideia-os/blob/main/design/graphics/r102-user-plan.md)
 §2.8 (system-monitor GUI: role + data source + widget layout) and
@@ -24,7 +27,7 @@ issue breakdown.
 | M4-003 | `q`-quit smoke | pending M3 |
 | M5-001 | Signed 1.0.0 release | pending M4 |
 | v1.1-B | `SysStatRecord@0.1` semantic-pipe emission wire (pdxwatch#12) | **landed 2026-09-08** |
-| v1.1-C | Release closer v1.1.0 + tag (pdxwatch#13) | pending v1.1-A + v1.1-B |
+| v1.1-C | Release closer v1.1.0 + tag (pdxwatch#13) | **landed 2026-09-08 (v1.1.0 tagged)** |
 
 ## v1.1-A "real-body extraction" landing details (pdxwatch#11)
 
@@ -119,6 +122,26 @@ Changes:
 - Fingerprint: pdxwatch's console/render surface is unchanged.
   The semantic pipe is an out-of-band structured emit channel; no
   duplicate write of any terminal / KIND_SURFACE payload.
+
+## v1.1-C "release closer" landing details (pdxwatch#13)
+
+Closes the Track-C wave. Version bump + tag only -- no source /
+caps.decl churn.
+
+- `CHANGELOG.md` (new, repo root): Keep-a-Changelog-style entry
+  for `[1.1.0] - 2026-09-08` enumerating v1.1-A (real syscall
+  body extraction) + v1.1-B (semantic-pipe emit wire). Sets the
+  category shape (Added / Changed / Removed / Notes) forward
+  releases inherit.
+- `manifest.pdxproj` `version = 1.0.0` -> `version = 1.1.0`. The
+  M5-001 forward-declaration placeholder gives way to the actual
+  Track-C release version; the signed-release closer at M5-001
+  remains a downstream milestone in its own right.
+- `STATUS.md` (this file): v1.1-C row flipped to `**landed**`,
+  header `Version:` line bumped to 1.1.0, this landing-details
+  section added.
+- Tag command (run by main, not this landing): `git tag -a v1.1.0
+  -m "pdxwatch v1.1.0 -- real syscalls + semantic-pipe emit"`.
 
 ## Dependencies
 
