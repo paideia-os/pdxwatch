@@ -1,0 +1,159 @@
+# pdxwatch — caps.decl
+#
+# Wave: R102 userland graphical stack -- reference apps
+# Milestone: M1 (scaffold + sys_taskinfo aggregation collectors)
+# Doc:  paideia-os/paideia-os monorepo -- design/graphics/r102-user-plan.md
+#       §2.8 (system-monitor GUI: role + data source + widget layout) and
+#       §4.8 (per-issue landing plan for R102.M1..M5).
+#
+# pdxwatch is the R102 system-monitor GUI: the graphical peer of
+# postui-top. It samples live-system stats once per second and renders
+# them as three stacked widgets (CPU bar-per-core, memory tri-color,
+# network sparkline) into a 480x360 KIND_SURFACE the compositor
+# scans out.
+#
+# This M1-001 landing (Track C v1.1-A -- pdxwatch #11) retires the
+# never-committed M1-001 STUB body: no scaffold code ever landed here,
+# so v1.1-A skips the "seed a returns-0 stub" step entirely and lands
+# the real syscall path directly. The v1.1 pass across the twelve
+# mature R102/R100 satellites uses the same "leapfrog the stub"
+# shape (postui-top #1 landed the equivalent real body in one round;
+# pdxwatch mirrors it for the system-monitor role).
+#
+# The M1-001 real body compiles into two loose ELF64 objects
+# (build-out/collectors.o + build-out/main.o) via tools/build.sh; the
+# downstream link into build-out/pdxwatch (with a real _start binder)
+# is a M1-002 packaging step, and the compositor / event-input wiring
+# is M2/M3 material. Every M1-001 syscall goes through a thin
+# `pw_sys_*` wrapper in src/collectors.pdx.
+#
+# ---------------------------------------------------------------------
+# KIND_SURFACE -- the render substrate (design/graphics/r102-user-
+# plan.md §2.6 libpdx-gfx surface substrate)
+# ---------------------------------------------------------------------
+#
+# pdxwatch holds one KIND_SURFACE cap: a 480x360 BGRA8888 back-buffer
+# minted at Main::main startup and committed once per second (or per
+# damage-rect batch) via libpdx-gfx's gfx_commit into svc-compositor.
+#
+# Rights layout (mirror libpdx-gfx's SurfaceHandle rights table --
+# design/graphics/r102-user-plan.md §7.2.1):
+#
+#   R_SURFACE_COMMIT   0x002   diff + commit a frame (the write analogue)
+#   R_SURFACE_MINT     0x200   derive a surface from a KIND_MEMORY parent
+#   R_SURFACE_REVOKE   0x020   teardown the surface row
+#
+# At M1-001 pdxwatch's collectors module (src/collectors.pdx) does
+# NOT touch the surface -- the sys_taskinfo aggregation runs before
+# any render. The mint + commit rights are declared HERE so the
+# M1-002 window-creation landing (which introduces the surface_open
+# + gfx_commit calls through libpdx-gfx) does not need a caps.decl
+# churn.
+#
+# ---------------------------------------------------------------------
+# KIND_IPC_ENDPOINT (subscribe) -- libpdx-event compositor channel
+# ---------------------------------------------------------------------
+#
+# pdxwatch subscribes via libpdx-event.M3 to a compositor-emitted
+# input channel; on POINTER_BUTTON_DOWN inside a CPU-bar rect the
+# clicked bar cycles compact <-> expanded, on KEYDOWN 'q' the main
+# loop exits. Declared here at M1-001 so the M3-001 input landing
+# (which introduces event_next + event_poll) does not need to
+# widen the manifest. Not exercised by the M1-001 collectors path
+# (which is stat-side only).
+#
+# ---------------------------------------------------------------------
+# KIND_MEMORY -- the surface backing store + collector scratch
+# ---------------------------------------------------------------------
+#
+# KIND_SURFACE derives over KIND_MEMORY (= KIND_PAGE, 4). pdxwatch
+# mints a KIND_MEMORY region sized 480 * 360 * 4 = 691_200 bytes at
+# M1-002 startup and hands it to libpdx-gfx's surface_open, which
+# performs the sys_cap_derive(KIND_SURFACE, ...) call; the derived
+# surface cap is what libpdx-gfx subsequently invokes for every
+# gfx_commit. The KIND_MEMORY authority is not held beyond the
+# derive.
+#
+# The M1-001 collectors path itself does not mint memory -- its
+# scratch (_pw_scratch, 64B taskinfo record staging) lives in .bss
+# via `pub let mut ... : [u8; 64] = uninit @align(8)`, which the
+# loader sizes as part of the ELF image.
+#
+requires:
+- KIND_SURFACE(mint, commit, revoke)
+- KIND_IPC_ENDPOINT(subscribe)
+- KIND_MEMORY(mint, revoke)
+
+# ---------------------------------------------------------------------
+# Syscall dependencies (informational; not consumed by the InitCap
+# sidecar -- the syscall gate is a kernel-side dispatch decision, not
+# a per-process cap check at M1). Enumerated here so downstream
+# tooling (release lint, dependency-audit) can trace pdxwatch's SC+
+# surface without reading every .pdx source.
+#
+# The M1-001 collectors path uses exactly two syscalls (the peer
+# postui-top uses the identical pair for the same reason: no
+# CPU/memory/network-specific SC+ surface exists yet, so the poll
+# module derives per-CPU active-task counts + total resident bytes
+# from the same task_pool snapshot postui-top consumes):
+#
+#   * sysno 66  -- sys_clock_read_ns() -> u64 ns
+#                  Monotonic ns-since-boot counter. collect_tick uses
+#                  it to gate the fixed-interval refresh (converting
+#                  the interval_ticks arg to a compatible ns-domain
+#                  deadline via shift, per src/collectors.pdx §Tick
+#                  semantics -- same 2^24-ns = 16.7ms tick as postui-
+#                  top's poll module).
+#   * sysno 83  -- sys_taskinfo(idx, user_buf_va)
+#                             -> 0 | -ENOENT | -ESRCH | -EFAULT
+#                  Ring-3 task-table introspection (paideia-os
+#                  design/user/syscall-table.md row 83). Fills a 64-
+#                  byte record per live task; collect_tick iterates
+#                  idx = 0..PW_MAX_TASKS and derives:
+#                    - task_state_counts[NEW..EXITED]  (from state
+#                      field)
+#                    - total_cpu_ticks  (sum of cpu_ticks field)
+#                    - total_rss_pages  (sum of rss_pages field; 0
+#                      at paideia-os HEAD pending PML4-walker
+#                      landing -- see task_info.pdx §rss_pages)
+#                    - per_cpu_active[0..PW_MAX_CPUS]  (naive
+#                      round-robin bucketing until sys_cpuinfo /
+#                      per-CPU affinity land in a follow-on round)
+#
+# The M2 render path will add libpdx-gfx's cap-invoke pathway (no
+# extra sysno beyond the KIND_SURFACE R_SURFACE_COMMIT invocation);
+# the M3 input path will add libpdx-event's sys_ipc_recv (sysno 40).
+# The M4 semantic-pipe emit path (SysStatRecord@0.1 producer, see
+# declares_output_schemas below) will add sysno 115 (sys_semantic_
+# send) -- landed cross-repo at v1.1-B (pdxwatch #12).
+# ---------------------------------------------------------------------
+syscalls:
+- sys_clock_read_ns @ 66
+- sys_taskinfo      @ 83
+
+# ---------------------------------------------------------------------
+# Declared output schemas
+# ---------------------------------------------------------------------
+#
+# pdxwatch will emit one first-class semantic-pipe schema at v1.1-B
+# (pdxwatch #12):
+#
+#   * SysStatRecord@0.1 -- one record per collect_tick refresh,
+#                          mirroring the CollectSnapshot struct
+#                          (num_cpus u64, per_cpu_active[8] u64,
+#                          total_cpu_ticks u64, total_rss_kb u64,
+#                          task_state_counts[8] u64 = 144B). Emitted
+#                          through sys_semantic_send (sysno 115).
+#                          Every downstream scraper (e.g. a monitoring
+#                          daemon reading `sysstat | pipe-consumer`)
+#                          consumes the same 32-byte-BLAKE3 schema
+#                          hash under the libpdx-semantic-pipe v1
+#                          contract.
+#
+# At M1-001 the emitter path is NOT scaffolded -- collectors.pdx
+# populates the in-memory snapshot only; no envelope encoder runs.
+# The schema name is declared here so the v1.1-B landing does not
+# need to introduce it and the downstream dependency-audit tree
+# already sees pdxwatch as a SysStatRecord producer.
+declares_output_schemas:
+- SysStatRecord@0.1

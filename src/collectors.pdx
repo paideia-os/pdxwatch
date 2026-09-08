@@ -1,0 +1,686 @@
+// src/collectors.pdx -- pdxwatch.M1-001 (paideia-os/pdxwatch#1)
+//                     -- v1.1-A real-body landing (pdxwatch#11)
+//
+// Collectors module: CollectSnapshot struct + fixed-tick sys_taskinfo
+// aggregation loop.
+//
+// =============================================================================
+// SCOPE (design/graphics/r102-user-plan.md §2.8 pdxwatch reference app)
+// =============================================================================
+//
+// The M1-001 landing seeds pdxwatch's data-source path: at a fixed
+// interval, iterate sys_taskinfo (SC+ sysno 83) across the task pool
+// and AGGREGATE each returned 64-byte kernel record into a single
+// CollectSnapshot struct the M2 CPU / mem / net widgets read from.
+// Unlike postui-top's row-per-task shape (48-byte task_row array),
+// pdxwatch's system-monitor view needs summed / bucketed values
+// only -- per-CPU active-task counts, total CPU-ticks, total
+// rss_pages -> KiB, and per-state task counts -- so this module
+// ships one aggregate struct instead of an N-row buffer.
+//
+// This module ships two callable entry points (collect_init,
+// collect_tick) plus the constants + backing storage they consume;
+// no widget code, no surface commit, no libpdx-event subscribe runs
+// at this landing (those land at M2 / M3 respectively per
+// design/graphics/r102-user-plan.md §3.8).
+//
+// The libpdx-gfx / libpdx-event dependencies (M2+ link-time consumers)
+// are declared in caps.decl + manifest.pdxproj but not exercised by
+// this M1-001 real body -- collectors.pdx compiles standalone under
+// build-out/collectors.o via tools/build.sh, no library symbols
+// resolved.
+//
+// =============================================================================
+// V1.1-A "RETIRE THE STUB BODY" LANDING (pdxwatch#11)
+// =============================================================================
+//
+// This file lands as pdxwatch's first source. The R102.M1-001 issue
+// (pdxwatch#1) named a stub-body scaffold as the seeding round, but
+// the v1.1 pass across the twelve mature R102 satellites uses the
+// "leapfrog the stub" shape: pdxwatch#11 (v1.1-A) skips the returns-0
+// stub entirely and lands the real syscall path directly. The body
+// below IS the real body -- there is no prior stub to diff against.
+//
+// The design deviation from the R102.M1-001 issue text ("stub"
+// framing) is that pdxwatch#11's v1.1-A framing explicitly retires
+// the stub concept: the wave-C pattern (postui-top#1, ls #ENH-021,
+// shell#R66 subset) has established that a well-scoped real-body
+// landing under 400 LOC is smaller and easier to review than the
+// stub + real-body two-round path, and this file adopts that
+// pattern. See the paideia-os monorepo MASTER_PLAN.md §Track-C
+// (v1.1 pass) for the org-wide milestone-alignment rationale.
+//
+// =============================================================================
+// MODULE NAME DEVIATION
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag
+// (manifest.pdxproj) requires the module name to match the file
+// basename PascalCased. File is `collectors.pdx` -> module
+// `Collectors`. Every external caller reaches this surface via the
+// nine pub let names below (COLLECT_STATE_BYTES / collect_init /
+// collect_tick / PW_ERR_* / PW_SNAP_OFF_*); the enclosing module
+// qualifier is a fingerprint marker only and does not appear in
+// the linker symbol table.
+//
+// =============================================================================
+// SC+ SYSCALL DEPENDENCIES (design/user/syscall-table.md, paideia-os)
+// =============================================================================
+//
+//   * sysno 66 = sys_clock_read_ns()          -> u64 ns since boot
+//   * sysno 83 = sys_taskinfo(idx, user_buf)  -> 0 | -ENOENT | -ESRCH | -EFAULT
+//
+// Both syscalls ARE live at paideia-os HEAD:
+//
+//   - sys_clock_read_ns: kernel body at src/kernel/core/syscall/
+//     handlers/clock_read_ns.pdx (R31.M2-001 landing).
+//   - sys_taskinfo: kernel body at src/kernel/core/syscall/
+//     sys_taskinfo.pdx (R57.M4-003 landing + R60.M7-002 64-byte-
+//     record extension). No stub is required -- the syscall number
+//     is real and the record shape is frozen at 64 bytes per
+//     src/kernel/core/sched/task_info.pdx §Record layout.
+//
+// pdxwatch's collectors path shares the exact syscall pair postui-
+// top's poll module uses (see paideia-os/postui-top src/poll.pdx),
+// which is the intentional design decision r102-user-plan.md §2.8
+// documented ("pdxwatch reads the same KIND_SYS_STAT cap postui-top
+// does and does its own aggregation, at extra client-side cost").
+// The KIND_SYS_STAT cap-invoke path is deferred to a follow-on
+// round (blocks on kind_sys_stat.pdx landing kernel-side).
+//
+// =============================================================================
+// TICK SEMANTICS
+// =============================================================================
+//
+// Same tick convention postui-top adopted: one "tick" = 2^24 ns =
+// 16.7ms, computed via a right-shift-by-24 conversion off
+// sys_clock_read_ns (encoder-safe -- single shr, no imul, no div).
+// pdxwatch's 1 Hz refresh corresponds to interval_ticks = ~60
+// (60 * 16.7ms ~= 1s); the actual value is caller-supplied via
+// collect_init so a M4 witness can drive at higher rates.
+//
+// PW_TICK_SHIFT is exported so a caller that already has a
+// ns-domain deadline can bypass the tick conversion by computing
+// its own shift; this is the same M1-002-deferred hardening hook
+// postui-top reserved (swap the conversion when sys_get_tick_count
+// SC+ lands).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Collectors`), matches file
+//     basename collectors.pdx.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF).
+//     Large sentinels (0xFFFFE20x band) are only used in `mov reg,
+//     imm` form -- paideia-as emits the 10-byte movabs encoding for
+//     imm > 0x7FFFFFFF, legal for mov but NOT for cmp/and.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all. Every
+//     multiplication uses `shl reg, N` or shl+add. Row-stride 144
+//     (snapshot layout) is only used as a fixed field offset
+//     (compile-time immediate), never a runtime multiply.
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first).
+//   - `xor reg, reg; mov_b reg, [ptr]` shape for every byte load
+//     (not exercised in this M1-001 body; postui-top's strnlen path
+//     was reserved for the row-array shape that pdxwatch's aggregate
+//     shape does not need).
+//   - r11 is scratch (paideia-as reserved). Nothing in this module
+//     touches r11 -- syscall clobbers rcx/r11 CPU-side but r11 is
+//     SysV caller-save so cross-call preservation is not our concern.
+//   - Every function that issues a nested call pushes an ODD count of
+//     8-byte callee-save registers so `rsp % 16 == 0` at the call
+//     boundary (SysV entry rsp%16==8; +5 pushes = 40 -> %16==0).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `pw_*`. Substring "loop" avoided defensively (labels use
+//     `_iter_` / `_scan_`).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall the encoder refuses).
+
+module Collectors = structure {
+
+  // ==========================================================================
+  // Error band (pdxwatch's wave-scoped high-nibble discriminator).
+  //
+  // pdxwatch claims 0xFFFFE200..0xFFFFE20F (postui-top holds
+  // 0xFFFFE000..0xFFFFE00F; the 0xFFFFE100..0xFFFFE1FF page is
+  // reserved by a mature kind's tail sentinels per the paideia-os
+  // authoritative kind-ordinal + failure-band registry). Verified
+  // against the monorepo via `grep -rhnE '0xFFFFE2[0-9A-F][0-9A-F]'
+  // src/ design/` at v1.1-A landing time (zero hits across the
+  // full 0xFFFFE200..0xFFFFE2FF page), so this landing claims only
+  // the first sub-band and leaves 0xFFFFE210..0xFFFFE2FF free
+  // headroom for pdxwatch's own M1-002+ growth (widget error
+  // sentinels, event-subscribe refuse codes, semantic-pipe emit
+  // refuse codes at v1.1-B).
+  //
+  // Sentinels within the pdxwatch band are allocated bottom-up:
+  //   +0  PW_ERR_BAD_STATE_PTR      collect_init/tick with a null state
+  //   +1  PW_ERR_INTERVAL_ZERO      collect_init with interval_ticks == 0
+  //   +2  PW_ERR_MAX_CPUS_EXCEEDED  M1-002 collect_init hardening reserve
+  //   +3..+F  reserved for M1-002+  (widget rect refuse, event refuse,
+  //                                  semantic-pipe emit refuse at v1.1-B)
+  //
+  // The M1-001 collect_init / collect_tick bodies DO NOT validate
+  // their arguments at this landing -- caller bugs surface as
+  // segfaults or wrong snapshot values rather than as sentinel
+  // returns. The sentinels are reserved here so the M1-002 defensive-
+  // gate landing does not need to introduce them.
+  // ==========================================================================
+  pub let PDXWATCH_OK                  : u64 = 0
+  pub let PDXWATCH_ERR_BAND_BASE       : u64 = 0xFFFFE200
+  pub let PDXWATCH_ERR_BAND_TOP        : u64 = 0xFFFFE20F
+
+  pub let PW_ERR_BAD_STATE_PTR         : u64 = 0xFFFFE200
+  pub let PW_ERR_INTERVAL_ZERO         : u64 = 0xFFFFE201
+  pub let PW_ERR_MAX_CPUS_EXCEEDED     : u64 = 0xFFFFE202
+
+  // ==========================================================================
+  // Kernel-side sys_taskinfo error sentinels (mirror src/kernel/core/
+  // sched/task_info.pdx TASK_INFO_ERR_* -- byte-for-byte identical).
+  // Reserved here so collect_tick's per-slot skip logic can name them
+  // symbolically once M1-002 introduces the -ESRCH-stops-iteration
+  // refinement (M1-001 treats any non-zero return as "skip this slot,
+  // continue" -- see pw_iter body).
+  // ==========================================================================
+  pub let PW_TI_ERR_ENOENT : u64 = 0xFFFFFFFFFFFFFFFE   // -2, empty slot
+  pub let PW_TI_ERR_ESRCH  : u64 = 0xFFFFFFFFFFFFFFFD   // -3, idx past end
+  pub let PW_TI_ERR_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2   // -14, bad user buf
+
+  // ==========================================================================
+  // CollectSnapshot layout (256 bytes, 32 qwords, @align(64) -- one
+  // L2 line, matching postui-top's PollState footprint choice).
+  //
+  //   [+0]    interval_ticks       (u64)   fixed refresh interval
+  //                                        (2^24-ns tick units)
+  //   [+8]    last_tick            (u64)   monotonic-clock tick
+  //                                        (ns >> PW_TICK_SHIFT) of
+  //                                        the last completed refresh;
+  //                                        0 pre-first-refresh so the
+  //                                        first collect_tick always
+  //                                        fires
+  //   [+16]   refresh_count        (u64)   monotonically increasing;
+  //                                        M4 seeded-stat witness reads
+  //                                        this to assert "the collector
+  //                                        actually ran"
+  //   [+24]   num_cpus             (u64)   count of per-CPU buckets
+  //                                        populated; hard-coded to 1
+  //                                        at M1-001 (single-CPU boot
+  //                                        assumption; the sys_cpuinfo
+  //                                        SC+ landing widens this at
+  //                                        M2)
+  //   [+32..+95]  per_cpu_active[0..8]     (u64 x 8)  round-robin
+  //                                        bucketed active-task counts;
+  //                                        idx % num_cpus buckets each
+  //                                        RUNNING task at M1-001
+  //                                        (naive; a real per-CPU
+  //                                        affinity source at
+  //                                        sys_cpuinfo landing time
+  //                                        replaces the bucket rule
+  //                                        without changing the layout)
+  //   [+96]   total_cpu_ticks      (u64)   sum of every task's
+  //                                        cpu_ticks field (100 Hz
+  //                                        LAPIC-tick cumulative);
+  //                                        M2 CPU-widget derives per-
+  //                                        core load from delta vs
+  //                                        prior snapshot (stored in
+  //                                        widget-owned prior-tick
+  //                                        scratch, not here)
+  //   [+104]  total_rss_kb         (u64)   sum of rss_pages << 2
+  //                                        (4 KiB pages -> KiB) across
+  //                                        all live tasks; feeds the
+  //                                        M2 memory tri-color widget
+  //   [+112..+175] task_state_counts[0..8] (u64 x 8)  per-state task
+  //                                        buckets (NEW=0, RUNNABLE=1,
+  //                                        RUNNING=2, BLOCKED=3,
+  //                                        EXITED=4 per src/kernel/
+  //                                        core/sched/state.pdx; slots
+  //                                        5..7 reserved for future
+  //                                        states -- SLEEPING/
+  //                                        ZOMBIE/TRACED)
+  //   [+176]  task_seen            (u64)   count of task_pool slots
+  //                                        that returned a valid
+  //                                        record this refresh (0..64)
+  //   [+184]  task_skipped         (u64)   count of task_pool slots
+  //                                        that returned non-zero
+  //                                        (ENOENT / ESRCH / EFAULT)
+  //   [+192..+255] reserved                64 bytes of growth room
+  //                                        (network sparkline bucket,
+  //                                        per-widget dirty flag,
+  //                                        semantic-pipe emit failure
+  //                                        counter at v1.1-B); zeroed
+  //                                        by collect_init so an
+  //                                        M1-002+ reader can trust an
+  //                                        unset field reads as 0
+  //                                        without requiring every
+  //                                        caller to pre-zero the
+  //                                        struct itself
+  //
+  // Chosen at 256 bytes so the M2/M3/M4 landings grow into the
+  // reserved region without another struct-resize churn; total
+  // footprint is one L1D line for the hot header + one L2 line for
+  // the whole struct.
+  // ==========================================================================
+  pub let COLLECT_STATE_BYTES              : u64 = 256
+
+  pub let PW_SNAP_OFF_INTERVAL_TICKS       : u64 = 0
+  pub let PW_SNAP_OFF_LAST_TICK            : u64 = 8
+  pub let PW_SNAP_OFF_REFRESH_COUNT        : u64 = 16
+  pub let PW_SNAP_OFF_NUM_CPUS             : u64 = 24
+  pub let PW_SNAP_OFF_PER_CPU_ACTIVE       : u64 = 32
+  pub let PW_SNAP_OFF_TOTAL_CPU_TICKS      : u64 = 96
+  pub let PW_SNAP_OFF_TOTAL_RSS_KB         : u64 = 104
+  pub let PW_SNAP_OFF_TASK_STATE_COUNTS    : u64 = 112
+  pub let PW_SNAP_OFF_TASK_SEEN            : u64 = 176
+  pub let PW_SNAP_OFF_TASK_SKIPPED         : u64 = 184
+  pub let PW_SNAP_OFF_RESERVED             : u64 = 192
+
+  // ==========================================================================
+  // Task-pool iteration ceiling (matches src/kernel/core/sched/
+  // task_pool.pdx MAX_PIDS = 64 at paideia-os HEAD). collect_tick
+  // iterates idx = 0..PW_MAX_TASKS -- iterating past the true pool
+  // size is safe (each -ESRCH increment is bucketed into task_skipped)
+  // but wastes syscalls.
+  // ==========================================================================
+  pub let PW_MAX_TASKS : u64 = 64
+
+  // ==========================================================================
+  // Per-CPU bucket ceiling. Sized 8 so the layout carries a full
+  // eight-core boot without a resize; num_cpus at M1-001 is hard-
+  // coded to 1 (single-core boot assumption), narrowing the used
+  // range to per_cpu_active[0] until sys_cpuinfo lands.
+  // ==========================================================================
+  pub let PW_MAX_CPUS : u64 = 8
+
+  // ==========================================================================
+  // sys_taskinfo record size (mirror TASK_INFO_RECORD_BYTES in
+  // src/kernel/core/sched/task_info.pdx). Frozen at 64 bytes at
+  // R60.M7-002 (#1817); a future record-shape evolution touches
+  // this one constant.
+  // ==========================================================================
+  pub let PW_TASKINFO_REC_BYTES : u64 = 64
+
+  // Kernel record offsets (see task_info.pdx §Record layout).
+  pub let PW_TIR_OFF_PID        : u64 = 0
+  pub let PW_TIR_OFF_STATE      : u64 = 8
+  pub let PW_TIR_OFF_NAME       : u64 = 16
+  pub let PW_TIR_OFF_CPU_TICKS  : u64 = 32
+  pub let PW_TIR_OFF_RSS_PAGES  : u64 = 40
+  pub let PW_TIR_OFF_START_TICK : u64 = 48
+
+  // Task-state enum values (mirror src/kernel/core/sched/state.pdx).
+  pub let PW_STATE_NEW      : u64 = 0
+  pub let PW_STATE_RUNNABLE : u64 = 1
+  pub let PW_STATE_RUNNING  : u64 = 2
+  pub let PW_STATE_BLOCKED  : u64 = 3
+  pub let PW_STATE_EXITED   : u64 = 4
+
+  // ==========================================================================
+  // SC+ sysno constants (design/user/syscall-table.md, paideia-os).
+  // Named locally so the two syscall wrappers below (pw_sys_clock_ns
+  // + pw_sys_taskinfo) name the SC+ ID in exactly one place per call.
+  // ==========================================================================
+  pub let PW_SYS_CLOCK_READ_NS : u64 = 66
+  pub let PW_SYS_TASKINFO      : u64 = 83
+
+  // ==========================================================================
+  // Tick conversion. See §TICK SEMANTICS above -- one tick = 2^24
+  // ns = 16.7ms at M1-001. Encoded as a shift constant so every
+  // conversion site (`shr rax, 24`) is a single instruction and the
+  // ratio is trivially auditable in this one place.
+  // ==========================================================================
+  pub let PW_TICK_SHIFT : u64 = 24
+
+  // ==========================================================================
+  // Scratch storage. _pw_scratch receives one raw 64-byte taskinfo
+  // record per sys_taskinfo call. Lives in .bss (zero-initialized at
+  // load); the pw_iter body overwrites it per-slot.
+  // ==========================================================================
+  pub let mut _pw_scratch : [u8; 64] = uninit @align(8)
+
+  // ==========================================================================
+  // pw_sys_clock_ns() -> u64 ns
+  //
+  // Thin wrapper around SC+ sysno 66 (sys_clock_read_ns). Returns
+  // monotonic ns since boot in rax. Nullary; no arg shuffle needed.
+  // Kernel body at src/kernel/core/syscall/handlers/clock_read_ns.pdx
+  // (paideia-os R31.M2-001).
+  //
+  // Leaf: syscall clobbers rcx/r11 (both SysV caller-save, harmless).
+  // Effect {sysreg} + no capability -- the syscall path itself needs
+  // the sysreg union but clock_read_ns has no cap gate.
+  // ==========================================================================
+  pub let pw_sys_clock_ns : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): SC+ sysno 66 (sys_clock_read_ns) wrapper. Nullary -- no SysV-to-SYSCALL arg shuffle. mov rax, 66; syscall; ret. Kernel body at paideia-os src/kernel/core/syscall/handlers/clock_read_ns.pdx returns _tick_count * 10_000_000 into rax (ns since boot). Leaf: rcx/r11 SYSCALL-clobbered, both SysV caller-save. Sole collect_tick consumer -- the returned ns is right-shifted by PW_TICK_SHIFT (24) to get an approximate tick count for last_tick / interval_ticks comparisons. Same wrapper shape postui-top's pl_sys_clock_ns uses (src/poll.pdx) -- both consumers share the exact clock-read discipline.",
+      block: {
+        mov rax, 66;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pw_sys_taskinfo(idx, user_buf) -> u64
+  //
+  // Thin wrapper around SC+ sysno 83 (sys_taskinfo). Fills the 64-
+  // byte record for task-pool index `idx` into the user buffer at
+  // `user_buf`. Returns 0 on success, or one of the PW_TI_ERR_*
+  // sentinels above (kernel forwards task_get_info's rax verbatim;
+  // see src/kernel/core/syscall/sys_taskinfo.pdx §Contract).
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2 < 4). Leaf.
+  //
+  // Effect row `!{mem, sysreg}` because the kernel writes up to 64
+  // bytes into the caller's user_buf. No capability (@{}) at M1 --
+  // the future KIND_TASKINFO with R_INTROSPECT rights policy will
+  // land at the dispatch shim, not this userspace wrapper.
+  // ==========================================================================
+  pub let pw_sys_taskinfo : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (idx: u64) (user_buf: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): SC+ sysno 83 (sys_taskinfo) wrapper. SysV rdi=idx / rsi=user_buf pass through unchanged to SYSCALL rdi/rsi (arity 2). mov rax, 83; syscall; ret. Kernel dispatch at src/kernel/core/syscall/dispatch.pdx does the user_ptr_ok gate + walker-copy from kernel scratch back to user_buf. Body at src/kernel/core/syscall/sys_taskinfo.pdx forwards to task_get_info; returns 0 on success (64B record written), 0xFFFFFFFFFFFFFFFE (-ENOENT, empty slot), 0xFFFFFFFFFFFFFFFD (-ESRCH, idx past MAX_PIDS=64), or 0xFFFFFFFFFFFFFFF2 (-EFAULT, bad user_buf). Leaf: rcx/r11 SYSCALL-clobbered (SysV caller-save). Sole consumer: pw_iter's per-slot aggregation in collect_tick body. Same wrapper shape postui-top's pl_sys_taskinfo uses (src/poll.pdx) -- both consumers share the exact task_pool iteration discipline.",
+      block: {
+        mov rax, 83;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // collect_init(state_ptr, interval_ticks) -> u64
+  //
+  // Initialize a CollectSnapshot struct in caller-provided memory.
+  // Zeroes the entire 256-byte region, then stamps two fields:
+  //   [+0]  interval_ticks = caller-supplied refresh interval
+  //   [+24] num_cpus = 1  (single-core boot assumption at M1-001)
+  //
+  // Every other field starts at 0 (refresh_count, last_tick, all
+  // per-CPU / task-state buckets, total_cpu_ticks, total_rss_kb,
+  // task_seen, task_skipped, the +192..+255 reserved region). This
+  // matches postui-top's poll_init discipline (DEBUGGER AUDIT FIXUP:
+  // never leave the reserved region caller-owned pre-init -- it is
+  // a latent footgun for any M1-002+ reader that trusts an unset
+  // reserved field to read as 0).
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a >=256B struct
+  //   rsi = interval_ticks    refresh interval in 2^24-ns units
+  //   -> rax = 0              always (no validation at M1-001; PW_ERR_*
+  //                           sentinels are reserved for M1-002)
+  //
+  // Register plan: zero pushes needed (no nested calls). rax is used
+  // as the 0 fill value for the zero loop; rcx is a byte cursor.
+  //
+  // Labels: pw_init_zero_scan / pw_init_zero_end (reserved-region
+  // zero loop only; the field-stamp postfix is linear/branch-free).
+  // ==========================================================================
+  pub let collect_init : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (interval_ticks: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): CollectSnapshot field-stamp initializer. Contract SysV rdi=state_ptr, rsi=interval_ticks. Body first zeroes the entire 256-byte region [rdi + 0..255] via a small qword scan loop (rcx=cursor starting at 0, incrementing by 8; loop exits via `cmp rcx, 256; jae pw_init_zero_end`) so every field including the +192..+255 reserved growth region reads as 0 for any M1-002+ reader that trusts an unset field. Then stamps [rdi + 0] = rsi (interval_ticks) and [rdi + 24] = 1 (num_cpus, single-CPU boot assumption -- the sys_cpuinfo SC+ landing at M2 widens this to real-CPU count via a matching cmpxchg-style widen). Return xor rax, rax (0=OK); PDXWATCH_OK. No validation at this landing -- caller bugs (null state_ptr, interval_ticks==0) surface as segfaults or wrong-refresh-rate behavior; the PW_ERR_* sentinels reserved above land defensive gates at M1-002. Zero pushes / pops -- no callee-save touched, no nested call. rdi/rsi/rcx are all SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem] (loop bound check is `cmp rcx, 256` against a register), no and reg,imm64. Every field offset (+0/+24) and every loop immediate (256, 8, 0, 1) fits imm8/imm32. Labels pw_init_zero_scan / pw_init_zero_end prefixed pw_, no reserved-keyword substrings. Leaf.",
+      block: {
+        // Zero the entire 256-byte CollectSnapshot region.
+        xor rax, rax;
+        xor rcx, rcx;
+        pw_init_zero_scan:
+        cmp rcx, 256;
+        jae pw_init_zero_end;
+        mov [rdi + rcx], rax;
+        add rcx, 8;
+        jmp pw_init_zero_scan;
+        pw_init_zero_end:
+
+        // Stamp interval_ticks.
+        mov [rdi + 0], rsi;
+        // Stamp num_cpus = 1 (single-CPU boot assumption at M1-001).
+        mov rax, 1;
+        mov [rdi + 24], rax;
+
+        // rax is currently 1; zero it for the OK return.
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // collect_tick(state_ptr) -> u64
+  //
+  // The fixed-interval refresh entry. Called every application loop
+  // step; either refreshes the aggregate snapshot (returning 1) or
+  // no-ops when the interval has not yet elapsed (returning 0).
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a CollectSnapshot populated by
+  //                           collect_init
+  //   -> rax = 1              refreshed -- every field updated,
+  //                           refresh_count incremented,
+  //                           last_tick anchored at commit time
+  //   -> rax = 0              not yet -- interval has not elapsed
+  //                           since the last refresh; state unchanged
+  //
+  // Algorithm:
+  //   1. now_tick = pw_sys_clock_ns() >> PW_TICK_SHIFT
+  //   2. If last_tick == 0 (collect_init's pre-first-refresh
+  //      sentinel), always refresh -- do not compute elapsed
+  //      against 0 (that would compare raw now_tick against
+  //      interval_ticks and mis-fire on early-boot small now_tick
+  //      values, per postui-top's poll_tick DEBUGGER AUDIT FIXUP).
+  //      Otherwise: if now_tick - last_tick < interval_ticks ->
+  //      return 0.
+  //   3. Re-zero the aggregate windows the iter step will accumulate
+  //      into: per_cpu_active[0..8], task_state_counts[0..8],
+  //      total_cpu_ticks, total_rss_kb, task_seen, task_skipped.
+  //      (interval_ticks, num_cpus, and the +192..+255 reserved
+  //      region are preserved across refreshes.)
+  //   4. Iterate idx = 0..PW_MAX_TASKS:
+  //      a. pw_sys_taskinfo(idx, &_pw_scratch)
+  //      b. If rax != 0 -> task_skipped += 1; continue (ENOENT /
+  //         ESRCH / EFAULT all fall into the same skip path at
+  //         M1-001; the -ESRCH-stops-iteration refinement is a
+  //         M1-002 hardening item).
+  //      c. Extract fields from _pw_scratch:
+  //         - state = scratch[+8..+16] (u64)
+  //         - cpu_ticks = scratch[+32..+40] (u64)
+  //         - rss_pages = scratch[+40..+48] (u64)
+  //      d. Aggregate:
+  //         - total_cpu_ticks += cpu_ticks
+  //         - total_rss_kb += rss_pages << 2  (4 KiB pages -> KiB)
+  //         - if state < 8: task_state_counts[state] += 1
+  //           (state > 7 folds into task_state_counts[7] slot
+  //           via clamp, so an unknown-state extension does not
+  //           corrupt neighboring memory)
+  //         - if state == PW_STATE_RUNNING (2):
+  //             cpu_bucket = task_seen % num_cpus
+  //             (naive round-robin at M1-001; sys_cpuinfo landing
+  //             swaps this for real cpu-affinity readout)
+  //             per_cpu_active[cpu_bucket] += 1
+  //         - task_seen += 1
+  //   5. Anchor last_tick at commit time (re-read sys_clock_read_ns
+  //      after the iterate step so post-iterate jitter is absorbed
+  //      into next-interval accounting), refresh_count += 1
+  //   6. Return 1
+  //
+  // Register plan: 5-push callee-save prologue (rbx / r12 / r13 /
+  // r14 / r15) = 40 bytes -> SysV entry rsp%16==8, +40 -> rsp%16==0.
+  // Every nested call (pw_sys_clock_ns, pw_sys_taskinfo) sees the
+  // aligned stack. Roles held across pw_iter steps:
+  //   rbx = state_ptr        r12 = num_cpus (loaded once from
+  //                                          [rbx + 24])
+  //   r13 = idx              r14 = task_seen accumulator
+  //   r15 = task_skipped accumulator
+  //
+  // The per-slot aggregations (total_cpu_ticks, total_rss_kb,
+  // per_cpu_active, task_state_counts) are done through direct
+  // memory ops (load-add-store) rather than through registers, so
+  // register pressure stays fixed at 5 callee-saves for the entire
+  // loop body regardless of how many aggregate fields grow at M2+.
+  //
+  // Labels prefixed pw_; substring "loop" avoided per encoder-
+  // reserved-keyword discipline (used `_iter_` / `_scan_` /
+  // `_reset_` instead).
+  // ==========================================================================
+  pub let collect_tick : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): fixed-interval task-pool aggregation entry. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=num_cpus, r13=idx, r14=task_seen, r15=task_skipped) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call. Phase A (interval gate): call pw_sys_clock_ns; shr rax, PW_TICK_SHIFT=24 (ns -> 16.7ms-tick); mov rcx, [rbx + 8] (last_tick). last_tick==0 sentinel: cmp rcx, 0; je pw_first_refresh (skip elapsed check on very first call so the documented \"first collect_tick always fires\" contract holds regardless of small early-boot now_tick values). Otherwise: sub rax, rcx (elapsed_ticks; unsigned wrap OK -- monotonic clock guarantees last_tick <= now_tick); mov rcx, [rbx + 0] (interval_ticks); cmp rax, rcx; jb pw_notyet (below = not enough elapsed). Phase B (reset the aggregate windows the iter step will accumulate into -- pw_reset_scan zeroes 8 qwords starting at [rbx + 32] (per_cpu_active), 2 qwords at [rbx + 96] (total_cpu_ticks + total_rss_kb), 8 qwords at [rbx + 112] (task_state_counts), 2 qwords at [rbx + 176] (task_seen + task_skipped). Each zero-window is a tight qword scan bounded by a compile-time immediate byte count -- no imul, no imm64). Phase C (load num_cpus): mov r12, [rbx + 24]. If num_cpus==0 (defensive; collect_init hard-codes 1 so this is dead code at M1-001 but survives a future collect_init contract change) fall back to r12=1 to avoid a divide-by-zero-shaped bucket wraparound. Phase D (iterate): xor r13, r13 (idx=0); xor r14, r14 (task_seen=0); xor r15, r15 (task_skipped=0); pw_iter_step: cmp r13, 64 (PW_MAX_TASKS); jae pw_iter_end. mov rdi, r13; lea rsi, [rip + _pw_scratch]; call pw_sys_taskinfo. cmp rax, 0; jne pw_iter_skip (non-zero -> skip slot; the -ESRCH-stops-iteration refinement is M1-002). Then extract + aggregate: (a) cpu_ticks: mov rax, [rip + _pw_scratch + 32]; mov rcx, [rbx + 96]; add rcx, rax; mov [rbx + 96], rcx (total_cpu_ticks += cpu_ticks). (b) rss_kb: mov rax, [rip + _pw_scratch + 40]; shl rax, 2 (pages -> KiB, 4KiB pages); mov rcx, [rbx + 104]; add rcx, rax; mov [rbx + 104], rcx (total_rss_kb += rss_pages<<2). (c) state bucket: mov rax, [rip + _pw_scratch + 8] (state); cmp rax, 8; jb pw_state_ok; mov rax, 7; pw_state_ok: (clamp state into [0..7]). Compute state_slot_ptr = rbx + 112 + state*8 via `mov rcx, rax; shl rcx, 3; lea rdx, [rbx + 112]; add rdx, rcx`. mov rcx, [rdx + 0]; add rcx, 1; mov [rdx + 0], rcx (task_state_counts[state] += 1). (d) per_cpu_active bucket if RUNNING: mov rax, [rip + _pw_scratch + 8]; cmp rax, 2 (PW_STATE_RUNNING); jne pw_not_running. Bucket = task_seen mod num_cpus computed via mask-when-power-of-two heuristic (M1-001 hard-codes num_cpus=1, so bucket=0 always at this landing -- the modulus is deferred to the sys_cpuinfo landing which introduces real multi-CPU affinity; for now compute bucket=0 unconditionally via xor rcx, rcx to keep the code path shaped correctly for the M2 widen). Compute cpu_slot_ptr = rbx + 32 + bucket*8 via `shl rcx, 3; lea rdx, [rbx + 32]; add rdx, rcx`. mov rcx, [rdx + 0]; add rcx, 1; mov [rdx + 0], rcx (per_cpu_active[bucket] += 1). pw_not_running: continue. (e) task_seen += 1: add r14, 1; jmp pw_iter_next. pw_iter_skip: add r15, 1. pw_iter_next: add r13, 1; jmp pw_iter_step. pw_iter_end: mov [rbx + 176], r14 (task_seen); mov [rbx + 184], r15 (task_skipped). Phase E (commit tick + refresh_count): call pw_sys_clock_ns; shr rax, 24; mov [rbx + 8], rax (last_tick). mov rax, [rbx + 16]; add rax, 1; mov [rbx + 16], rax (refresh_count += 1). Phase F (return 1): mov rax, 1; 5-pop; ret. pw_notyet: xor rax, rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (state*8 and bucket*8 use shl rcx, 3; per_cpu_active offset uses lea + add, never a runtime multiply of 8-byte stride against a runtime index that would need imul); no `and reg, imm64` (state clamp uses cmp+jb+mov rather than and rax, 7 which fits imm8 but the cmp form is more auditable); no `cmp reg, [mem]` (every compare loads through a scratch first); no `mul` mnemonic. Every immediate in cmp/shr/shl fits imm8 (0, 1, 2, 3, 7, 8, 24, 32, 40, 64, 96, 104, 112, 176, 184, 256). No byte load path in this M1-001 body (postui-top's strnlen path was reserved for the row-array shape; the aggregate shape has no per-byte scan). Labels prefixed pw_ (substring \"loop\" avoided defensively; encoder-reserved keywords never appear). Cross-module calls (pw_sys_clock_ns / pw_sys_taskinfo) are all leaf syscall wrappers per the two `pub let`s above -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                              // rbx = state_ptr
+
+        // ---- Phase A: interval gate ----------------------------------------
+        call pw_sys_clock_ns;
+        shr rax, 24;                               // rax = now_tick
+        mov rcx, [rbx + 8];                        // rcx = last_tick
+        cmp rcx, 0;
+        je pw_first_refresh;
+        sub rax, rcx;                              // rax = elapsed_ticks
+        mov rcx, [rbx + 0];                        // rcx = interval_ticks
+        cmp rax, rcx;
+        jb pw_notyet;
+        pw_first_refresh:
+
+        // ---- Phase B: reset the aggregate windows --------------------------
+        xor rax, rax;
+        // per_cpu_active[0..8] at [rbx + 32..96]  (8 qwords)
+        mov rcx, 32;
+        pw_reset_percpu_scan:
+        cmp rcx, 96;
+        jae pw_reset_percpu_end;
+        mov [rbx + rcx], rax;
+        add rcx, 8;
+        jmp pw_reset_percpu_scan;
+        pw_reset_percpu_end:
+        // total_cpu_ticks + total_rss_kb at [rbx + 96], [rbx + 104]
+        mov [rbx + 96], rax;
+        mov [rbx + 104], rax;
+        // task_state_counts[0..8] at [rbx + 112..176]  (8 qwords)
+        mov rcx, 112;
+        pw_reset_states_scan:
+        cmp rcx, 176;
+        jae pw_reset_states_end;
+        mov [rbx + rcx], rax;
+        add rcx, 8;
+        jmp pw_reset_states_scan;
+        pw_reset_states_end:
+        // task_seen + task_skipped at [rbx + 176], [rbx + 184]
+        mov [rbx + 176], rax;
+        mov [rbx + 184], rax;
+
+        // ---- Phase C: load num_cpus ----------------------------------------
+        mov r12, [rbx + 24];                       // r12 = num_cpus
+        cmp r12, 0;
+        jne pw_cpus_ok;
+        mov r12, 1;                                // defensive fallback
+        pw_cpus_ok:
+
+        // ---- Phase D: iterate task_pool slots ------------------------------
+        xor r13, r13;                              // idx = 0
+        xor r14, r14;                              // task_seen = 0
+        xor r15, r15;                              // task_skipped = 0
+
+        pw_iter_step:
+        cmp r13, 64;                               // PW_MAX_TASKS
+        jae pw_iter_end;
+
+        mov rdi, r13;                              // idx
+        lea rsi, [rip + _pw_scratch];              // dst = _pw_scratch
+        call pw_sys_taskinfo;
+        cmp rax, 0;
+        jne pw_iter_skip;                          // non-zero -> skip slot
+
+        // (a) total_cpu_ticks += cpu_ticks (scratch[+32..+40])
+        mov rax, [rip + _pw_scratch + 32];
+        mov rcx, [rbx + 96];
+        add rcx, rax;
+        mov [rbx + 96], rcx;
+
+        // (b) total_rss_kb += rss_pages << 2 (scratch[+40..+48])
+        mov rax, [rip + _pw_scratch + 40];
+        shl rax, 2;
+        mov rcx, [rbx + 104];
+        add rcx, rax;
+        mov [rbx + 104], rcx;
+
+        // (c) task_state_counts[state] += 1  (state clamped to [0..7])
+        mov rax, [rip + _pw_scratch + 8];          // state
+        cmp rax, 8;
+        jb pw_state_ok;
+        mov rax, 7;                                // clamp overflow -> slot 7
+        pw_state_ok:
+        mov rcx, rax;                              // state
+        shl rcx, 3;                                // state * 8
+        lea rdx, [rbx + 112];
+        add rdx, rcx;                              // task_state_counts + state*8
+        mov rcx, [rdx + 0];
+        add rcx, 1;
+        mov [rdx + 0], rcx;
+
+        // (d) per_cpu_active[bucket] += 1 iff state == RUNNING
+        mov rax, [rip + _pw_scratch + 8];
+        cmp rax, 2;                                // PW_STATE_RUNNING
+        jne pw_not_running;
+        // Bucket = 0 at M1-001 (num_cpus == 1 by construction; the
+        // sys_cpuinfo landing at M2 swaps this for real CPU affinity
+        // readout, at which point bucket becomes task_seen % num_cpus).
+        xor rcx, rcx;                              // bucket = 0
+        shl rcx, 3;                                // bucket * 8  (still 0)
+        lea rdx, [rbx + 32];
+        add rdx, rcx;                              // per_cpu_active + bucket*8
+        mov rcx, [rdx + 0];
+        add rcx, 1;
+        mov [rdx + 0], rcx;
+        pw_not_running:
+
+        // (e) task_seen += 1
+        add r14, 1;
+        jmp pw_iter_next;
+
+        pw_iter_skip:
+        add r15, 1;
+
+        pw_iter_next:
+        add r13, 1;
+        jmp pw_iter_step;
+
+        pw_iter_end:
+        mov [rbx + 176], r14;                      // task_seen
+        mov [rbx + 184], r15;                      // task_skipped
+
+        // ---- Phase E: commit tick + refresh_count --------------------------
+        call pw_sys_clock_ns;
+        shr rax, 24;
+        mov [rbx + 8], rax;                        // last_tick
+        mov rax, [rbx + 16];
+        add rax, 1;
+        mov [rbx + 16], rax;                       // refresh_count += 1
+
+        // ---- Phase F: return 1 ---------------------------------------------
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pw_notyet:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

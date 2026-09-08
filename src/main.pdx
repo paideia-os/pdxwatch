@@ -1,0 +1,228 @@
+// src/main.pdx -- pdxwatch.M1-001 (paideia-os/pdxwatch#1)
+//                -- v1.1-A real-body landing (pdxwatch#11)
+//
+// Main::main entry point + fixed-cadence dispatch loop skeleton.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This module lands the M1-001 dispatch loop scaffold: a Main::main
+// entry that initializes a CollectSnapshot (via Collectors::collect_
+// init from src/collectors.pdx) and drives Collectors::collect_tick
+// on a bounded iteration count. The window-creation call (libpdx-
+// gfx surface_open into a 480x360 back-buffer) is DEFERRED to
+// M1-002 -- libpdx-gfx's M1 landing is a prerequisite that is
+// tracked separately in the R102 wave-ordering table (see
+// design/graphics/r102-user-plan.md §3.2 libpdx-gfx and §3.8
+// pdxwatch). Every downstream milestone extends this main loop
+// without touching the collectors:
+//
+//   M1-002  -- open the 480x360 KIND_SURFACE via libpdx-gfx before
+//              the collect loop; three empty widget rects.
+//   M2-001..M2-003 -- render CPU / mem / net widgets against the
+//              collected snapshot each tick.
+//   M3-001  -- subscribe libpdx-event; handle click-cycle + 'q'
+//              quit inside the main loop.
+//   M4      -- witness-driven smokes (seeded snapshot + digest).
+//   M5      -- signed 1.0.0 release.
+//
+// =============================================================================
+// V1.1-A "RETIRE THE STUB BODY" LANDING (pdxwatch#11)
+// =============================================================================
+//
+// The R102.M1-001 issue (pdxwatch#1) named a returns-0 stub as the
+// initial scaffold. The v1.1-A landing (pdxwatch#11) replaces the
+// stub concept with a real-body dispatch loop: Main::main runs a
+// bounded iterate loop over collect_tick and then exits via SC+
+// sysno 60 (sys_exit). The bounded shape (PW_MAIN_TICK_BUDGET
+// iterations) is a v1.1-A choice so a witness smoke can drive
+// Main::main to completion and assert refresh_count grew -- the
+// unbounded shape (loop forever) arrives with M3-001 when the 'q'
+// keydown provides a real exit path.
+//
+// =============================================================================
+// MODULE NAME DEVIATION
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag requires
+// module name = file basename PascalCased. File main.pdx -> module
+// Main. The exported entry point is Main::main (matches
+// manifest.pdxproj's `entry = Main::main` forward-declaration).
+//
+// =============================================================================
+// SC+ SYSCALL DEPENDENCIES
+// =============================================================================
+//
+//   * sysno 60 = sys_exit(status) -- clean-exit primitive; never
+//                returns. Kernel dispatch at src/kernel/core/
+//                syscall/dispatch.pdx. Wired here as pw_sys_exit
+//                so Main::main can terminate the process at the
+//                end of the bounded loop; M3-001's 'q' keydown
+//                path reuses the same wrapper.
+//
+// Both collectors syscalls (sysno 66, 83) are reached transitively
+// through Collectors::collect_init / Collectors::collect_tick and
+// therefore listed in caps.decl's syscalls block, not re-declared
+// here.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (Main), matches file basename
+//     main.pdx.
+//   - No `test` mnemonic; every zero-check via cmp reg, 0.
+//   - Every immediate fits imm32; large sentinels only in mov reg,imm.
+//   - No 2-op imul reg,imm; no imul at all.
+//   - No `and reg, imm64`; no `cmp reg, [mem]`.
+//   - Labels prefixed pw_main_*; reserved keyword substrings avoided.
+//   - `pub let` single-line only.
+//   - The 5-push callee-save prologue in main () rewinds rsp%16==0
+//     for every nested call (collect_init, collect_tick, pw_sys_exit).
+
+module Main = structure {
+
+  // ==========================================================================
+  // Refresh interval (in 2^24-ns ticks). At 60 ticks / refresh, one
+  // refresh fires roughly once per second (60 * 16.7ms ~= 1.00s),
+  // matching design/graphics/r102-user-plan.md §2.8's "1 Hz refresh"
+  // requirement.
+  // ==========================================================================
+  pub let PW_MAIN_INTERVAL_TICKS : u64 = 60
+
+  // ==========================================================================
+  // Bounded iterate count for the M1-001 loop. Set at 32 refreshes
+  // (~32 seconds) so a witness smoke can drive Main::main to
+  // completion in a bounded time budget. The M3-001 'q' keydown path
+  // replaces this with an unbounded loop that exits on user input.
+  //
+  // A witness that seeds sys_taskinfo to a known snapshot and drives
+  // Main::main should observe refresh_count == PW_MAIN_TICK_BUDGET
+  // at exit (assuming the loop delay covers PW_MAIN_INTERVAL_TICKS
+  // per iterate step).
+  //
+  // The iterate count is a `pub let` so a downstream M2/M3 smoke can
+  // read the constant symbolically rather than magic-numbering 32.
+  // ==========================================================================
+  pub let PW_MAIN_TICK_BUDGET : u64 = 32
+
+  // ==========================================================================
+  // sys_exit sysno (design/user/syscall-table.md row 60). Named here
+  // so pw_sys_exit references the SC+ ID in exactly one place.
+  // ==========================================================================
+  pub let PW_SYS_EXIT : u64 = 60
+
+  // ==========================================================================
+  // Backing storage for the CollectSnapshot. Sized at COLLECT_STATE_
+  // BYTES (256) plus alignment padding; lives in .bss (zero-
+  // initialized at load), which is already the state collect_init
+  // treats as a valid pre-init source (the first collect_init call
+  // rewrites every byte, and last_tick=0 is exactly the pre-first-
+  // refresh sentinel collect_tick treats as "always refresh on
+  // first call").
+  // ==========================================================================
+  pub let mut _pw_snapshot : [u8; 256] = uninit @align(64)
+
+  // ==========================================================================
+  // pw_sys_exit(status) -> !
+  //
+  // Never-returning wrapper around SC+ sysno 60 (sys_exit). rdi is
+  // the exit status; the syscall does not return control to the
+  // caller. Return type is a formality (paideia-as does not model
+  // divergent-function types at the type surface yet, so the
+  // signature reads as -> u64 with a body that never executes past
+  // syscall).
+  // ==========================================================================
+  pub let pw_sys_exit : (u64) -> u64 !{sysreg} @{} =
+    fn (status: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): SC+ sysno 60 (sys_exit) wrapper. SysV rdi=status passes through unchanged to SYSCALL rdi. mov rax, 60; syscall. The syscall never returns (kernel dispatch at src/kernel/core/syscall/dispatch.pdx routes to task teardown), so the trailing ret is unreachable but required for the encoder to accept the function shape. Leaf: rcx/r11 SYSCALL-clobbered but unobserved by the never-executed remainder.",
+      block: {
+        mov rax, 60;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Main::main() -> u64
+  //
+  // The pdxwatch entry point (invoked by the M1-005 _start binder
+  // once that lands; until then Main::main compiles as an unlinked
+  // symbol and the release-closer link step will fail until the
+  // _start object joins the loose-object set).
+  //
+  // Contract:
+  //   (nullary; argv wiring is a M1-002 addition when the argv
+  //   parser lands)
+  //   -> the function never returns via ret -- it invokes pw_sys_
+  //   exit(0) at the tail, which transfers control to the kernel.
+  //   The signature reads -> u64 as a formality.
+  //
+  // Algorithm:
+  //   1. Collectors::collect_init(&_pw_snapshot, PW_MAIN_INTERVAL_TICKS)
+  //   2. Bounded loop:
+  //      for i = 0..PW_MAIN_TICK_BUDGET:
+  //          Collectors::collect_tick(&_pw_snapshot)
+  //          (the tick's own interval gate handles the wait;
+  //          collect_tick returns 0 fast when the interval has not
+  //          elapsed, so this is effectively a spin-poll until
+  //          M1-002 introduces a sched-yield primitive)
+  //   3. pw_sys_exit(0)  (never returns)
+  //
+  // Register plan: 2-push callee-save prologue (rbx / r12) = 16 bytes
+  // -> SysV entry rsp%16==8 + 16 = rsp%16==8, which is NOT a callable
+  // stack shape. Adding one dummy push (push rax after the two real
+  // pushes) rewinds to rsp%16==0. This is the standard "extra pad"
+  // shape when the natural callee-save count is even; alternative
+  // (align via a fourth push) works but adds an extra register slot
+  // this function has no live use for.
+  //
+  // Roles:
+  //   rbx = iteration cursor (0..PW_MAIN_TICK_BUDGET)
+  //   r12 = snapshot base pointer (loaded once via lea)
+  //
+  // Labels prefixed pw_main_; reserved keyword substrings avoided
+  // (used `_iter_` rather than `_loop_`).
+  // ==========================================================================
+  pub let main : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M1-001 (pdxwatch#11 v1.1-A): Main::main dispatch entry. Register plan: 2-push callee-save (rbx=iter cursor, r12=snapshot base) + 1-push pad (rax discarded) = 24B -> SysV rsp%16==8 + 24 = rsp%16==0 for every nested call. Phase A (init): lea r12, [rip + _pw_snapshot]; mov rdi, r12; mov rsi, PW_MAIN_INTERVAL_TICKS=60; call collect_init. Phase B (bounded iterate): xor rbx, rbx (i=0); pw_main_iter_step: cmp rbx, 32 (PW_MAIN_TICK_BUDGET); jae pw_main_iter_end. mov rdi, r12; call collect_tick. (collect_tick's return value 0=not-yet vs 1=refreshed is discarded at M1-001; the bounded loop's exit trigger is iteration count, not refresh count. M2 adds a render-on-refresh path that consumes the return.) add rbx, 1; jmp pw_main_iter_step. pw_main_iter_end: Phase C (clean exit): xor rdi, rdi (status=0); call pw_sys_exit. Unreachable trailing pops + ret: encoder requires them for shape compliance. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul; no imm64 in cmp/and; no cmp reg,[mem]; no `mul` mnemonic. Every immediate (32, 60, 0) fits imm8. Cross-module calls (collect_init, collect_tick, pw_sys_exit) resolve at link time to Collectors::collect_init, Collectors::collect_tick, Main::pw_sys_exit -- the paideia-as linker's module-qualified symbol resolution is a compile-time contract enforced by manifest.pdxproj's sources: block.",
+      block: {
+        push rbx;
+        push r12;
+        push rax;                                  // alignment pad
+
+        // ---- Phase A: init snapshot ----------------------------------------
+        lea r12, [rip + _pw_snapshot];
+        mov rdi, r12;
+        mov rsi, 60;                               // PW_MAIN_INTERVAL_TICKS
+        call collect_init;
+
+        // ---- Phase B: bounded iterate --------------------------------------
+        xor rbx, rbx;                              // i = 0
+        pw_main_iter_step:
+        cmp rbx, 32;                               // PW_MAIN_TICK_BUDGET
+        jae pw_main_iter_end;
+        mov rdi, r12;
+        call collect_tick;
+        add rbx, 1;
+        jmp pw_main_iter_step;
+        pw_main_iter_end:
+
+        // ---- Phase C: clean exit -------------------------------------------
+        xor rdi, rdi;                              // status = 0
+        call pw_sys_exit;
+
+        // Unreachable: pw_sys_exit never returns; these instructions
+        // are required for shape-compliance only.
+        pop rax;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

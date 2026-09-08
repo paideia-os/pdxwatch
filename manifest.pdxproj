@@ -1,0 +1,120 @@
+# pdxwatch -- paideia-as build manifest
+#
+# Wave: R102 userland graphical stack -- reference apps
+# Milestone: M1 (scaffold + sys_taskinfo aggregation collectors)
+# Doc: paideia-os monorepo -- design/graphics/r102-user-plan.md §2.8
+#      (system-monitor GUI: role + data source + widget layout)
+#      and §4.8 (per-issue landing plan).
+#
+# pdxwatch is a userspace TOOL binary (a system-monitor GUI) built
+# on top of libpdx-gfx + libpdx-event + libpdx-font. Unlike a
+# library (kind = library, no _start), pdxwatch is a program a user
+# launches at the shell prompt -- kind = tool, one _start, one
+# output ELF.
+#
+# ---------------------------------------------------------------------
+# M1-001 real-body landing (paideia-os/pdxwatch#11, v1.1-A)
+# ---------------------------------------------------------------------
+#
+# Scope: app scaffold + fixed-tick sys_taskinfo aggregation collectors
+# populating an in-memory CollectSnapshot; Main::main dispatch loop
+# runs collect_init + a bounded collect_tick iterate + sys_exit clean
+# exit. src/collectors.pdx and src/main.pdx land together at v1.1-A
+# (the R102.M1-001 issue's stub-body concept is retired -- see
+# src/collectors.pdx §V1.1-A "RETIRE THE STUB BODY" LANDING for the
+# design rationale).
+#
+# Every source enumerated below with an M-tag beyond M1-001 is a
+# milestone forward-declaration and will have a `sources:` entry
+# added as its landing round writes it. The per-file `paideia-as
+# build --emit elf64` step in tools/build.sh compiles every listed
+# source into a loose ELF64 object under build-out/; the final link
+# into build-out/pdxwatch (with a real _start binder) is a downstream
+# packaging step that lands with M1-005 -- until then this manifest
+# describes a growing loose-object set, not a linkable binary.
+#
+# This mirrors the shape postui-top/manifest.pdxproj established for
+# the same monorepo-satellite pattern.
+
+name        = pdxwatch
+version     = 1.0.0
+kind        = tool
+# entry lands at M1-005 (_start binder + Main::main call). At M1-001
+# there is no _start; Main::main is the forward-declared entry that
+# tools/build.sh compiles into build-out/main.o. Named here so the
+# M1-005 landing does not need to churn this manifest.
+entry       = Main::main                    # DEFERRED until M1-005; see STATUS.md
+output      = build-out/pdxwatch
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). Every file
+# listed below is compiled into build-out/<basename>.o by
+# tools/build.sh. M1-001 (v1.1-A) seeds src/collectors.pdx +
+# src/main.pdx; the M1-002..M4 landings each add their own source
+# entry as the module body lands.
+sources:
+  - src/collectors.pdx            # M1-001: CollectSnapshot + collect_init + collect_tick sys_taskinfo aggregator
+  - src/main.pdx                  # M1-001: Main::main dispatch loop + pw_sys_exit
+  # - src/argv.pdx                # M1-002: argv parser (deferred; blocks on libpdx-argv v1.1.0 in the same wave)
+  # - src/widget_cpu.pdx          # M2-001: CPU bar-per-core widget
+  # - src/widget_mem.pdx          # M2-002: memory tri-color widget
+  # - src/widget_net.pdx          # M2-003: network sparkline widget
+  # - src/input.pdx               # M3-001: click-cycle + 'q' quit input handler
+  # - src/semantic_emit.pdx       # v1.1-B: SysStatRecord@0.1 emitter via sys_semantic_send (sysno 115)
+
+# --- Library dependencies -----------------------------------------------
+# libpdx-gfx / libpdx-event / libpdx-font are the primary graphical
+# stack dependencies; M1-002+ will link their object sets into the
+# pdxwatch ELF. At M1-001 pdxwatch's collectors module is pure
+# userspace with two sys_* wrappers and no library calls yet -- the
+# dependencies are declared here so the M1-002 window-creation
+# landing does not have to introduce them. Version floors match
+# design/graphics/r102-user-plan.md §3.2 / §3.3 / §3.1 M1 landings.
+deps:
+  - libpdx-gfx   @ ^0.1           # M1-002: surface_open (480x360 KIND_SURFACE)
+  - libpdx-event @ ^0.1           # M3-001: event_next / event_poll
+  - libpdx-font  @ ^0.1           # M2-001..M2-003: gfx_draw_glyph label rendering
+
+# --- Test targets ------------------------------------------------------
+# Populated starting M4-001 (seeded-stat render smoke). Every entry
+# below becomes a `paideia-as build --tests` target once the
+# corresponding issue lands. Fail-code family bands for pdxwatch per
+# src/collectors.pdx §Error band:
+#   collect_tick fingerprint         0xFFFFE2F0..0xFFFFE2FF   (M4-001)
+tests:
+  # (empty at M1-001; M4-001 adds tests/seeded_stat_smoke.pdx once
+  # the KIND_SYS_STAT seeding primitive lands cross-repo)
+
+# --- Documentation targets ---------------------------------------------
+# .pdxdoc file(s) shipped at M5 packaging time.
+docs:
+  # (empty at M1-001; M5-001 adds doc/pdxwatch.pdxdoc)
+
+# --- Paideia-as compliance flags ---------------------------------------
+# Same invariant set postui-top / postui / shell / libpdx-* satellites
+# observe. A build under a non-conforming paideia-as revision refuses
+# fast in tools/build.sh's version-floor check.
+compliance:
+  - module-basename-pascal        # module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release policy (M5-001) -------------------------------------------
+# Dual-signed release mirroring postui-top / shell shape. Lands at
+# M5-001 (pdxwatch v1.0.0 release closer). ML-DSA-65 is the primary
+# post-quantum signer; Ed25519 rides as a secondary classical signer
+# per the same dual-sign policy postui.M5-003 and shell.M5-001
+# established. `pkg install pdxwatch` requires BOTH signatures to
+# verify.
+release:
+  signer_author: snunez+pdxwatch-author@paideia-os.dev
+  signer_root:   paideia-os-release-root@paideia-os.dev
+  mldsa_level:   65
+  ed25519:       required
+  mirror_target: pkgs.paideia-os
+  tarball:       pdxwatch-v1.0.0.tar.gz
+  manifest_kind: satellite-tool
