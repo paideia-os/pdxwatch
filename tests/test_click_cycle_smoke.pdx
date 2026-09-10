@@ -1,0 +1,694 @@
+// tests/test_click_cycle_smoke.pdx -- pdxwatch.M4-002 (paideia-os/pdxwatch#8)
+//
+// TestClickCycleSmoke module: encoder-half smoke for the click-cycle
+// CPU-bar detail-mode transition documented at design/graphics/r102-
+// user-plan.md §2.8 / §4.8 R102.M4-002.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Per design/graphics/r102-user-plan.md §2.8 pdxwatch reference app:
+// each CPU bar in the CPU-per-core widget carries a detail mode
+// (compact or expanded). A pointer-button-down inside a CPU-bar rect
+// cycles that bar's mode: compact -> expanded -> compact. An expanded
+// bar renders sub-bar visualization (per-task load slices for that
+// CPU) in place of the compact single-bar strip; a compact bar
+// renders only the summary strip.
+//
+// M4-002 (this landing) is the local build-time smoke that gates the
+// paideia-os QEMU smoke: it exercises the click-cycle STATE MACHINE
+// against a scripted click sequence and asserts the state transitions
+// match the design contract. If the state machine drifts, the QEMU
+// smoke has no point booting -- the observable "pdxwatch click-cycle
+// ok" fingerprint that a live-guest run produces on serial output is
+// only meaningful when the underlying state machine is intact.
+//
+// The M4-002 issue names three witnesses:
+//
+//   1. Scripted-click into CPU bar #0 flips its detail mode from
+//      compact (PCC_MODE_COMPACT=0) to expanded (PCC_MODE_EXPANDED=1).
+//   2. A subsequent render pass observes an expanded bar and emits
+//      sub-bar rendering (sub_bars_rendered counter increments).
+//   3. Idempotent-under-toggle: two clicks on the same bar return
+//      it to compact and the render pass observes no expanded bars.
+//
+// The fingerprint 'pdxwatch click-cycle ok' the issue names is the
+// serial-console STRING the paideia-os QEMU-side smoke script emits
+// when this module's pcc_run_all() returns 0 (mirroring shell.M4-003
+// tsm_run_all()'s gate-then-boot shape at paideia-os/shell#14). The
+// string is NOT emitted from ring-3 assembly here -- pdxwatch's live
+// KIND_TTY writer path (libpdx-tty) is a separate M3+ substrate;
+// this module returns a fail-code sentinel from the 0xFFFFE2Cx band
+// that the smoke script maps to the "click-cycle ok / failed" verdict.
+//
+// =============================================================================
+// V1.1-STYLE LEAPFROG (M4-002 lands ahead of M3-001)
+// =============================================================================
+//
+// The R102.M4-002 issue lists M3-001 (click-cycle + 'q' quit input
+// handler) as a dependency. M3-001 itself blocks on libpdx-event M3
+// (event_subscribe + event_next wrappers), which is not yet landed
+// in the R102 wave. This encoder-half smoke lands NOW so the state
+// machine's transition contract is testable at every build, even
+// while the substrate (libpdx-event.M3 subscription + input.pdx
+// dispatch) is still deferred.
+//
+// The state machine lives INSIDE this test module (as fixture-scoped
+// pcc_state_* helpers) rather than in src/click_cycle.pdx, because
+// M3-001 has not yet chosen its own click-dispatch shape (a plain
+// event-driven callback, a message-queue drain, a poll-then-batch
+// pattern all remain open per design/graphics/r102-user-plan.md §3.5
+// libpdx-event M3 note). When M3-001 lands, its src/input.pdx
+// materializes the "real" click-cycle state module and this smoke's
+// pcc_state_* helpers become either (a) direct callers of the real
+// module's entry points (thin wrappers) or (b) retired in favor of a
+// M4-002-successor smoke test that drives the real module. Either
+// way, the transition CONTRACT (compact <-> expanded cycle, sub-bar
+// render witness, idempotent-under-toggle) codified here does not
+// change.
+//
+// =============================================================================
+// STATE LAYOUT (96 bytes, @align(8))
+// =============================================================================
+//
+//   [+0..+64)    modes[0..8]         (u64 x 8)  per-CPU-bar detail mode
+//                                                 0 = PCC_MODE_COMPACT
+//                                                 1 = PCC_MODE_EXPANDED
+//                                                 The u64-per-mode width
+//                                                 is deliberate: matches
+//                                                 pdxwatch's collector
+//                                                 convention (every field
+//                                                 is u64, no packed byte
+//                                                 fields), which keeps the
+//                                                 encoder discipline
+//                                                 uniform across
+//                                                 src/collectors.pdx and
+//                                                 test fixtures.
+//   [+64]        click_count         (u64)      cumulative clicks handled
+//                                               (across all bars); a
+//                                               witness reads this to
+//                                               assert scripted-click
+//                                               dispatch occurred
+//   [+72]        render_pass_count   (u64)      cumulative render calls
+//                                               (increments once per
+//                                               pcc_state_render entry)
+//   [+80]        sub_bars_rendered   (u64)      cumulative sub-bar render
+//                                               operations (increments
+//                                               once per expanded bar
+//                                               encountered during render);
+//                                               a value > 0 means "sub-
+//                                               bar rendering appeared",
+//                                               satisfying the M4-002
+//                                               witness clause
+//   [+88..+96)   reserved            (u64)      8 bytes of growth room
+//                                               (per-widget hover state,
+//                                               damage bits, animation
+//                                               phase for a M2+ mode
+//                                               transition)
+//
+// Sized at 96 bytes so the layout accommodates the M3-001 formal
+// landing without struct-resize churn (the reserved slot swaps to a
+// libpdx-event-side hover flag once event_next() dispatches hover
+// events too, per r102-user-plan.md §3.5 M3 hover-hint deferred item).
+//
+// =============================================================================
+// SCENARIO (the "scripted-click into CPU bar #0" run)
+// =============================================================================
+//
+// Sequence of events M4-002 asserts:
+//
+//   (1) pcc_state_init(state)              -> all modes compact,
+//                                             all counters zero
+//   (2) pcc_state_render(state)            -> baseline render pass;
+//                                             render_pass_count=1,
+//                                             sub_bars_rendered=0
+//                                             (no expanded bars yet)
+//   (3) pcc_state_click(state, 0)          -> mode[0] = EXPANDED (1),
+//                                             click_count=1
+//   (4) pcc_state_render(state)            -> render_pass_count=2,
+//                                             sub_bars_rendered=1
+//                                             (bar 0 is expanded, so
+//                                             one sub-bar was drawn)
+//   (5) pcc_state_click(state, 0)          -> mode[0] = COMPACT (0),
+//                                             click_count=2 (toggle-
+//                                             back leg)
+//   (6) pcc_state_render(state)            -> render_pass_count=3,
+//                                             sub_bars_rendered=1
+//                                             (no further expanded bars;
+//                                             sub_bars_rendered
+//                                             stays at 1)
+//
+// The three test cases below (pcc_case_baseline, pcc_case_click_bar0,
+// pcc_case_toggle) each drive a subset of the scenario against a
+// re-initialized state so the case can be understood in isolation.
+//
+// =============================================================================
+// FAIL CODES (0xFFFFE2Cx band; pdxwatch reserves 0xFFFFE210..0xFFFFE2FF
+// per src/collectors.pdx §Error band)
+// =============================================================================
+//
+//   0            PCC_PASS                    all cases + assertions passed
+//   0xFFFFE2C0   PCC_FAIL_BASELINE_MODE      baseline: some mode was not
+//                                            COMPACT after init
+//   0xFFFFE2C1   PCC_FAIL_BASELINE_CLICK     baseline: click_count != 0
+//                                            after init
+//   0xFFFFE2C2   PCC_FAIL_BASELINE_SUB       baseline: sub_bars_rendered
+//                                            != 0 after init + one render
+//   0xFFFFE2C3   PCC_FAIL_BASELINE_RENDER    baseline: render_pass_count
+//                                            != 1 after one render
+//   0xFFFFE2C4   PCC_FAIL_CLICK_MODE         click_bar0: mode[0] !=
+//                                            EXPANDED after one click
+//   0xFFFFE2C5   PCC_FAIL_CLICK_OTHERS       click_bar0: some mode[i] for
+//                                            i in 1..8 was not COMPACT
+//                                            (only bar 0 should have flipped)
+//   0xFFFFE2C6   PCC_FAIL_CLICK_COUNT        click_bar0: click_count != 1
+//   0xFFFFE2C7   PCC_FAIL_CLICK_SUB          click_bar0: sub_bars_rendered
+//                                            != 1 after click + render
+//   0xFFFFE2C8   PCC_FAIL_CLICK_RENDER       click_bar0: render_pass_count
+//                                            != 1 after one render post-click
+//   0xFFFFE2C9   PCC_FAIL_TOGGLE_MODE        toggle: mode[0] != COMPACT
+//                                            after two clicks
+//   0xFFFFE2CA   PCC_FAIL_TOGGLE_COUNT       toggle: click_count != 2
+//   0xFFFFE2CB   PCC_FAIL_TOGGLE_SUB         toggle: sub_bars_rendered
+//                                            != 0 after both-back render
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestClickCycleSmoke`), matches
+//     file basename test_click_cycle_smoke.pdx.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` fits imm32 (<= 0x7FFFFFFF); fail-code
+//     sentinels (0xFFFFE2Cx) appear only in `mov rax, imm` returns
+//     which take the movabs 10-byte form legally.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all. Byte-
+//     stride multiplications (bar_idx * 8) use `shl reg, 3`.
+//   - No `and reg, imm64`; no `cmp reg, [mem]` (every compare loads
+//     through a scratch first).
+//   - r11 is scratch (paideia-as reserved); the module does not
+//     touch it.
+//   - `pub let` single-line only (multiline `pub let ="..."` is a
+//     paideia-as pitfall the encoder refuses).
+//   - Every function that issues a nested call rewinds rsp to
+//     rsp%16==0 at the call boundary. Case entries push exactly one
+//     callee-save (rbx) to hold state_ptr across the state-machine
+//     calls; SysV entry rsp%16==8 + 8B push = rsp%16==0 for every
+//     nested call.
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `pcc_*`. Substring "loop" avoided defensively (labels use
+//     `_scan_` / `_step_` / `_end_`).
+
+module TestClickCycleSmoke = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFE2Cx band; within pdxwatch's headroom of
+  // 0xFFFFE210..0xFFFFE2FF reserved for M1-002+ growth per
+  // src/collectors.pdx §Error band).
+  // ==========================================================================
+  pub let PCC_PASS                    : u64 = 0
+  pub let PCC_FAIL_BASELINE_MODE      : u64 = 0xFFFFE2C0
+  pub let PCC_FAIL_BASELINE_CLICK     : u64 = 0xFFFFE2C1
+  pub let PCC_FAIL_BASELINE_SUB       : u64 = 0xFFFFE2C2
+  pub let PCC_FAIL_BASELINE_RENDER    : u64 = 0xFFFFE2C3
+  pub let PCC_FAIL_CLICK_MODE         : u64 = 0xFFFFE2C4
+  pub let PCC_FAIL_CLICK_OTHERS       : u64 = 0xFFFFE2C5
+  pub let PCC_FAIL_CLICK_COUNT        : u64 = 0xFFFFE2C6
+  pub let PCC_FAIL_CLICK_SUB          : u64 = 0xFFFFE2C7
+  pub let PCC_FAIL_CLICK_RENDER       : u64 = 0xFFFFE2C8
+  pub let PCC_FAIL_TOGGLE_MODE        : u64 = 0xFFFFE2C9
+  pub let PCC_FAIL_TOGGLE_COUNT       : u64 = 0xFFFFE2CA
+  pub let PCC_FAIL_TOGGLE_SUB         : u64 = 0xFFFFE2CB
+
+  // ==========================================================================
+  // State-layout constants (see §STATE LAYOUT above).
+  // ==========================================================================
+  pub let PCC_STATE_BYTES             : u64 = 96
+  pub let PCC_MAX_BARS                : u64 = 8
+  pub let PCC_MODE_COMPACT            : u64 = 0
+  pub let PCC_MODE_EXPANDED           : u64 = 1
+  pub let PCC_OFF_MODES               : u64 = 0
+  pub let PCC_OFF_CLICK_COUNT         : u64 = 64
+  pub let PCC_OFF_RENDER_COUNT        : u64 = 72
+  pub let PCC_OFF_SUB_BARS            : u64 = 80
+
+  // ==========================================================================
+  // Fixture buffer (.bss). Sized at 12 qwords = 96 bytes to match
+  // PCC_STATE_BYTES. Zero-initialized at load; pcc_state_init rewrites
+  // every byte on entry so pre-init contents are irrelevant.
+  // ==========================================================================
+  pub let mut _pcc_state : [u64; 12] = uninit @align(8)
+
+  // ==========================================================================
+  // pcc_state_init(state_ptr) -> u64
+  //
+  // Zero the entire 96-byte state region (mode array, click_count,
+  // render_pass_count, sub_bars_rendered, reserved). Always returns 0
+  // (PCC_PASS) at this landing -- no validation. Leaf function; no
+  // pushes.
+  //
+  // Contract:
+  //   rdi = state_ptr    VA of a >=96B ClickCycleState-shaped buffer
+  //   -> rax = 0         always
+  // ==========================================================================
+  pub let pcc_state_init : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8): ClickCycleState zero-fill initializer. Contract SysV rdi=state_ptr. Body zeroes the entire 96-byte region [rdi + 0..95] via a qword scan loop (rcx=byte cursor starting at 0, incrementing by 8; loop exits via `cmp rcx, 96; jae pcc_init_zero_end`). Return xor rax, rax (0=PCC_PASS). Zero pushes / pops -- no callee-save touched, no nested call. rdi/rax/rcx are all SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem], no and reg,imm64. Every loop immediate (96, 8, 0) fits imm8. Labels pcc_init_zero_scan / pcc_init_zero_end prefixed pcc_, no reserved-keyword substrings (substring 'loop' avoided; labels use _scan_ / _end_). Leaf.",
+      block: {
+        xor rax, rax;                          // zero fill value
+        xor rcx, rcx;                          // byte cursor = 0
+        pcc_init_zero_scan:
+        cmp rcx, 96;                           // PCC_STATE_BYTES
+        jae pcc_init_zero_end;
+        mov [rdi + rcx], rax;
+        add rcx, 8;
+        jmp pcc_init_zero_scan;
+        pcc_init_zero_end:
+        xor rax, rax;                          // PCC_PASS
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pcc_state_click(state_ptr, bar_idx) -> u64
+  //
+  // Handle one scripted-click on CPU bar #bar_idx. Flips mode[bar_idx]
+  // via `new = 1 - old` (works for both compact->expanded and
+  // expanded->compact directions since mode is always 0 or 1). Bumps
+  // click_count. Always returns 0.
+  //
+  // Contract:
+  //   rdi = state_ptr    VA of a ClickCycleState
+  //   rsi = bar_idx      caller-verified in [0..PCC_MAX_BARS); this
+  //                      landing does NOT bounds-check bar_idx -- the
+  //                      scripted-click driver (pcc_case_*) always
+  //                      passes a fixed constant. The M3-001 landing
+  //                      that dispatches real event_next() clicks is
+  //                      responsible for pre-filtering out-of-bounds
+  //                      indices before reaching this call.
+  //   -> rax = 0         always
+  //
+  // Leaf; no callee-save touched.
+  // ==========================================================================
+  pub let pcc_state_click : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (bar_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8): scripted-click handler. Contract SysV rdi=state_ptr, rsi=bar_idx. Body computes mode[bar_idx] address = rdi + PCC_OFF_MODES(0) + bar_idx*8: mov rax, rsi; shl rax, 3 (bar_idx * 8); lea rdx, [rdi + 0]; add rdx, rax. Load old mode: mov rcx, [rdx + 0]. Flip: mov rax, 1; sub rax, rcx (new = 1 - old; works for both 0->1 and 1->0 since mode is bit-shaped by construction). Store: mov [rdx + 0], rax. Bump click_count at [rdi + PCC_OFF_CLICK_COUNT(64)]: mov rax, [rdi + 64]; add rax, 1; mov [rdi + 64], rax. Return xor rax, rax (PCC_PASS). Zero pushes / pops -- leaf. Encoder discipline: no `test` (no zero-check needed at all), no imul (bar_idx * 8 via shl rax, 3), no imm64 in cmp/and (only imm8 constants 0, 1, 3, 64), no cmp reg,[mem] (loads through rcx first). Labels: none needed (linear control flow). Leaf.",
+      block: {
+        // Compute mode[bar_idx] address: rdi + 0 + bar_idx*8
+        mov rax, rsi;                          // bar_idx
+        shl rax, 3;                            // bar_idx * 8
+        lea rdx, [rdi + 0];                    // modes base
+        add rdx, rax;                          // mode[bar_idx] address
+
+        // Flip mode: new = 1 - old
+        mov rcx, [rdx + 0];                    // old mode
+        mov rax, 1;
+        sub rax, rcx;                          // new mode
+        mov [rdx + 0], rax;
+
+        // Bump click_count at [rdi + 64]
+        mov rax, [rdi + 64];
+        add rax, 1;
+        mov [rdi + 64], rax;
+
+        xor rax, rax;                          // PCC_PASS
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pcc_state_render(state_ptr) -> u64
+  //
+  // Scan every bar; for each mode == EXPANDED, increment sub_bars_rendered
+  // (as the render-witness that "sub-bar rendering appeared"). Increment
+  // render_pass_count unconditionally. Always returns 0.
+  //
+  // This is the model of what M3-001's render dispatch will do post-
+  // click: it walks the per-bar state array and picks compact vs
+  // expanded draw paths. At the M4-002 encoder-half, no gfx_commit or
+  // libpdx-gfx call runs; the render "witness" is the counter increment
+  // alone. M3-001's landing wires the compact/expanded branch to the
+  // real libpdx-gfx draw calls and this function's contract stays the
+  // same at the counter-witness surface.
+  //
+  // Contract:
+  //   rdi = state_ptr
+  //   -> rax = 0        always
+  //
+  // Leaf; no callee-save touched.
+  // ==========================================================================
+  pub let pcc_state_render : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8): render pass witness. Contract SysV rdi=state_ptr. Body iterates bar_idx = 0..PCC_MAX_BARS(8): xor rcx, rcx (bar_idx=0); pcc_render_scan: cmp rcx, 8; jae pcc_render_end. Load mode[bar_idx]: mov rax, rcx; shl rax, 3 (bar_idx*8); mov rdx, [rdi + rax]. Check EXPANDED: cmp rdx, 1; jne pcc_render_next. If expanded, bump sub_bars_rendered at [rdi + 80]: mov rax, [rdi + 80]; add rax, 1; mov [rdi + 80], rax. pcc_render_next: add rcx, 1; jmp pcc_render_scan. pcc_render_end: bump render_pass_count at [rdi + 72]: mov rax, [rdi + 72]; add rax, 1; mov [rdi + 72], rax. Return xor rax, rax (PCC_PASS). Zero pushes / pops -- leaf. Encoder discipline: no `test`, no imul (bar_idx*8 via shl rax, 3), no imm64 in cmp/and (only imm8 constants 0, 1, 3, 8, 72, 80), no cmp reg,[mem] (state loaded to rdx first, mode loaded to rdx-side then compared with cmp rdx, imm). Labels pcc_render_scan / pcc_render_next / pcc_render_end all prefixed pcc_; substring 'loop' avoided (uses _scan_ / _next_ / _end_). Leaf.",
+      block: {
+        xor rcx, rcx;                          // bar_idx = 0
+        pcc_render_scan:
+        cmp rcx, 8;                            // PCC_MAX_BARS
+        jae pcc_render_end;
+
+        // Load mode[bar_idx]
+        mov rax, rcx;
+        shl rax, 3;                            // bar_idx * 8
+        mov rdx, [rdi + rax];                  // mode[bar_idx]
+
+        // If EXPANDED (mode == 1), bump sub_bars_rendered
+        cmp rdx, 1;
+        jne pcc_render_next;
+        mov rax, [rdi + 80];                   // sub_bars_rendered
+        add rax, 1;
+        mov [rdi + 80], rax;
+
+        pcc_render_next:
+        add rcx, 1;
+        jmp pcc_render_scan;
+
+        pcc_render_end:
+        // Bump render_pass_count
+        mov rax, [rdi + 72];                   // render_pass_count
+        add rax, 1;
+        mov [rdi + 72], rax;
+
+        xor rax, rax;                          // PCC_PASS
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pcc_case_baseline() -> u64
+  //
+  // Init state, run one render pass, assert:
+  //   * every mode[0..8] == COMPACT (0)
+  //   * click_count == 0
+  //   * render_pass_count == 1
+  //   * sub_bars_rendered == 0
+  //
+  // This case establishes that a fresh state has all bars compact and
+  // that a render pass over an all-compact state emits zero sub-bar
+  // renders. Without this baseline, a false-positive from
+  // pcc_case_click_bar0 (say, sub_bars_rendered was already 1 from a
+  // pre-existing state contamination) would be indistinguishable from
+  // the real click-cycle transition.
+  //
+  // 1-push prologue (rbx=state_ptr) so state_ptr survives the two
+  // nested calls (pcc_state_init, pcc_state_render). SysV rsp%16==8 +
+  // 8B push = rsp%16==0 at every nested call.
+  // ==========================================================================
+  pub let pcc_case_baseline : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8): baseline case -- verifies fresh state after init + one render. 1-push callee-save prologue (rbx=state_ptr) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (init): lea rbx, [rip + _pcc_state]; mov rdi, rbx; call pcc_state_init. Phase B (baseline render): mov rdi, rbx; call pcc_state_render. Phase C (assertions): (1) every mode[0..7] == 0: iterate rcx=0..8, load mode[rcx] via `mov rax, rcx; shl rax, 3; mov rdx, [rbx + rax]; cmp rdx, 0; jne pcc_bs_mode_fail`. (2) click_count == 0: mov rax, [rbx + 64]; cmp rax, 0; jne pcc_bs_click_fail. (3) render_pass_count == 1: mov rax, [rbx + 72]; cmp rax, 1; jne pcc_bs_render_fail. (4) sub_bars_rendered == 0: mov rax, [rbx + 80]; cmp rax, 0; jne pcc_bs_sub_fail. Return xor rax, rax (PCC_PASS). Encoder discipline: no `test`, no imul, no imm64 in cmp, no cmp reg,[mem] (state loaded to rax/rdx first). Labels pcc_bs_* prefixed pcc_; no reserved-keyword substrings. Fail returns each carry a distinct 0xFFFFE2Cx sentinel so an operator reading a test log can distinguish which assertion caught the drift.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _pcc_state];
+
+        // Phase A: init
+        mov rdi, rbx;
+        call pcc_state_init;
+
+        // Phase B: baseline render
+        mov rdi, rbx;
+        call pcc_state_render;
+
+        // Phase C: assert every mode[0..8] == COMPACT (0)
+        xor rcx, rcx;
+        pcc_bs_mode_scan:
+        cmp rcx, 8;
+        jae pcc_bs_mode_end;
+        mov rax, rcx;
+        shl rax, 3;
+        mov rdx, [rbx + rax];
+        cmp rdx, 0;
+        jne pcc_bs_mode_fail;
+        add rcx, 1;
+        jmp pcc_bs_mode_scan;
+        pcc_bs_mode_end:
+
+        // Assert click_count == 0
+        mov rax, [rbx + 64];
+        cmp rax, 0;
+        jne pcc_bs_click_fail;
+
+        // Assert render_pass_count == 1
+        mov rax, [rbx + 72];
+        cmp rax, 1;
+        jne pcc_bs_render_fail;
+
+        // Assert sub_bars_rendered == 0
+        mov rax, [rbx + 80];
+        cmp rax, 0;
+        jne pcc_bs_sub_fail;
+
+        xor rax, rax;                          // PCC_PASS
+        pop rbx;
+        ret;
+
+        pcc_bs_mode_fail:
+        mov rax, 0xFFFFE2C0;                   // PCC_FAIL_BASELINE_MODE
+        pop rbx;
+        ret;
+
+        pcc_bs_click_fail:
+        mov rax, 0xFFFFE2C1;                   // PCC_FAIL_BASELINE_CLICK
+        pop rbx;
+        ret;
+
+        pcc_bs_render_fail:
+        mov rax, 0xFFFFE2C3;                   // PCC_FAIL_BASELINE_RENDER
+        pop rbx;
+        ret;
+
+        pcc_bs_sub_fail:
+        mov rax, 0xFFFFE2C2;                   // PCC_FAIL_BASELINE_SUB
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pcc_case_click_bar0() -> u64
+  //
+  // Init state, scripted-click CPU bar #0, run one render pass, assert:
+  //   * mode[0] == EXPANDED (1)
+  //   * every mode[1..8] == COMPACT (0)   -- only bar 0 flipped
+  //   * click_count == 1
+  //   * render_pass_count == 1
+  //   * sub_bars_rendered == 1            -- sub-bar rendering appeared
+  //
+  // THIS IS THE PRIMARY M4-002 WITNESS: the click-cycle transition
+  // from compact to expanded plus the sub-bar-rendering witness.
+  //
+  // 1-push prologue (rbx=state_ptr) so state_ptr survives the three
+  // nested calls (pcc_state_init, pcc_state_click, pcc_state_render).
+  // ==========================================================================
+  pub let pcc_case_click_bar0 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8) PRIMARY WITNESS: scripted-click into CPU bar #0. 1-push callee-save prologue (rbx=state_ptr) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (init): lea rbx, [rip + _pcc_state]; mov rdi, rbx; call pcc_state_init. Phase B (click bar 0): mov rdi, rbx; xor rsi, rsi (bar_idx=0); call pcc_state_click. Phase C (render): mov rdi, rbx; call pcc_state_render. Phase D (assertions): (1) mode[0] == EXPANDED(1): mov rax, [rbx + 0]; cmp rax, 1; jne pcc_cb_mode_fail. (2) every mode[1..7] == COMPACT(0): iterate rcx=1..8, load mode[rcx], cmp with 0. (3) click_count == 1: mov rax, [rbx + 64]; cmp rax, 1; jne pcc_cb_count_fail. (4) render_pass_count == 1: mov rax, [rbx + 72]; cmp rax, 1; jne pcc_cb_render_fail. (5) sub_bars_rendered == 1 (WITNESS: sub-bar rendering appeared): mov rax, [rbx + 80]; cmp rax, 1; jne pcc_cb_sub_fail. Return PCC_PASS. If ANY assertion fails, this case returns a distinct 0xFFFFE2Cx sentinel and the paideia-os smoke script emits 'pdxwatch click-cycle FAILED at <sentinel>' instead of 'pdxwatch click-cycle ok' on serial output. Encoder discipline: same as pcc_case_baseline. Labels pcc_cb_* prefixed pcc_.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _pcc_state];
+
+        // Phase A: init
+        mov rdi, rbx;
+        call pcc_state_init;
+
+        // Phase B: scripted-click bar 0
+        mov rdi, rbx;
+        xor rsi, rsi;                          // bar_idx = 0
+        call pcc_state_click;
+
+        // Phase C: render
+        mov rdi, rbx;
+        call pcc_state_render;
+
+        // Phase D-1: assert mode[0] == EXPANDED (1)
+        mov rax, [rbx + 0];
+        cmp rax, 1;
+        jne pcc_cb_mode_fail;
+
+        // Phase D-2: assert every mode[1..8] == COMPACT (0)
+        mov rcx, 1;
+        pcc_cb_others_scan:
+        cmp rcx, 8;
+        jae pcc_cb_others_end;
+        mov rax, rcx;
+        shl rax, 3;
+        mov rdx, [rbx + rax];
+        cmp rdx, 0;
+        jne pcc_cb_others_fail;
+        add rcx, 1;
+        jmp pcc_cb_others_scan;
+        pcc_cb_others_end:
+
+        // Phase D-3: assert click_count == 1
+        mov rax, [rbx + 64];
+        cmp rax, 1;
+        jne pcc_cb_count_fail;
+
+        // Phase D-4: assert render_pass_count == 1
+        mov rax, [rbx + 72];
+        cmp rax, 1;
+        jne pcc_cb_render_fail;
+
+        // Phase D-5: assert sub_bars_rendered == 1 (WITNESS)
+        mov rax, [rbx + 80];
+        cmp rax, 1;
+        jne pcc_cb_sub_fail;
+
+        xor rax, rax;                          // PCC_PASS
+        pop rbx;
+        ret;
+
+        pcc_cb_mode_fail:
+        mov rax, 0xFFFFE2C4;                   // PCC_FAIL_CLICK_MODE
+        pop rbx;
+        ret;
+
+        pcc_cb_others_fail:
+        mov rax, 0xFFFFE2C5;                   // PCC_FAIL_CLICK_OTHERS
+        pop rbx;
+        ret;
+
+        pcc_cb_count_fail:
+        mov rax, 0xFFFFE2C6;                   // PCC_FAIL_CLICK_COUNT
+        pop rbx;
+        ret;
+
+        pcc_cb_render_fail:
+        mov rax, 0xFFFFE2C8;                   // PCC_FAIL_CLICK_RENDER
+        pop rbx;
+        ret;
+
+        pcc_cb_sub_fail:
+        mov rax, 0xFFFFE2C7;                   // PCC_FAIL_CLICK_SUB
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pcc_case_toggle() -> u64
+  //
+  // Init state, scripted-click CPU bar #0 twice (compact -> expanded ->
+  // compact), run one render pass, assert:
+  //   * mode[0] == COMPACT (0)            -- toggled back
+  //   * click_count == 2                  -- both clicks counted
+  //   * sub_bars_rendered == 0            -- no expanded bars visible
+  //                                          at render time
+  //
+  // This case proves the click-cycle is genuinely a CYCLE, not a
+  // one-way expand: a second click returns bar 0 to compact and the
+  // subsequent render does NOT increment sub_bars_rendered. Without
+  // this witness, a state machine that flips on the first click but
+  // sticks on the second (a plausible bug for a naive `mode |= 1`
+  // implementation vs the intended `mode = 1 - mode` toggle) would
+  // pass pcc_case_click_bar0 but fail here.
+  //
+  // 1-push prologue (rbx=state_ptr).
+  // ==========================================================================
+  pub let pcc_case_toggle : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8): toggle-back case -- verifies click-cycle is a genuine CYCLE (not a stuck one-way flip). 1-push callee-save prologue (rbx=state_ptr) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (init): lea rbx, [rip + _pcc_state]; mov rdi, rbx; call pcc_state_init. Phase B1 (click 1, compact->expanded): mov rdi, rbx; xor rsi, rsi; call pcc_state_click. Phase B2 (click 2, expanded->compact): mov rdi, rbx; xor rsi, rsi; call pcc_state_click. Phase C (render): mov rdi, rbx; call pcc_state_render. Phase D (assertions): (1) mode[0] == COMPACT(0) -- toggled back: mov rax, [rbx + 0]; cmp rax, 0; jne pcc_tg_mode_fail. (2) click_count == 2: mov rax, [rbx + 64]; cmp rax, 2; jne pcc_tg_count_fail. (3) sub_bars_rendered == 0 -- no expanded bars at render time: mov rax, [rbx + 80]; cmp rax, 0; jne pcc_tg_sub_fail. Return PCC_PASS. Encoder discipline: same as pcc_case_baseline. Labels pcc_tg_* prefixed pcc_. The `sub rax, rcx` flip in pcc_state_click (which computes 1-mode) is the mnemonic the toggle case guards against a `or rax, 1` regression that would leave a sticky expanded flag; the assertion (3) here catches the render-side witness of that latent bug.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _pcc_state];
+
+        // Phase A: init
+        mov rdi, rbx;
+        call pcc_state_init;
+
+        // Phase B1: click bar 0 (compact -> expanded)
+        mov rdi, rbx;
+        xor rsi, rsi;
+        call pcc_state_click;
+
+        // Phase B2: click bar 0 again (expanded -> compact)
+        mov rdi, rbx;
+        xor rsi, rsi;
+        call pcc_state_click;
+
+        // Phase C: render
+        mov rdi, rbx;
+        call pcc_state_render;
+
+        // Phase D-1: assert mode[0] == COMPACT (0)
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne pcc_tg_mode_fail;
+
+        // Phase D-2: assert click_count == 2
+        mov rax, [rbx + 64];
+        cmp rax, 2;
+        jne pcc_tg_count_fail;
+
+        // Phase D-3: assert sub_bars_rendered == 0
+        mov rax, [rbx + 80];
+        cmp rax, 0;
+        jne pcc_tg_sub_fail;
+
+        xor rax, rax;                          // PCC_PASS
+        pop rbx;
+        ret;
+
+        pcc_tg_mode_fail:
+        mov rax, 0xFFFFE2C9;                   // PCC_FAIL_TOGGLE_MODE
+        pop rbx;
+        ret;
+
+        pcc_tg_count_fail:
+        mov rax, 0xFFFFE2CA;                   // PCC_FAIL_TOGGLE_COUNT
+        pop rbx;
+        ret;
+
+        pcc_tg_sub_fail:
+        mov rax, 0xFFFFE2CB;                   // PCC_FAIL_TOGGLE_SUB
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pcc_run_all() -> u64
+  //
+  // Drive all three cases in sequence: baseline, click_bar0, toggle.
+  // Stop-on-first-fail; return 0 on all-pass. The paideia-os M4+ smoke
+  // harness calls this as a pre-QEMU gate (mirroring shell.M4-003
+  // tsm_run_all()); a non-zero return means the click-cycle state
+  // machine is broken and the QEMU smoke's 'pdxwatch click-cycle ok'
+  // serial fingerprint would be a lie.
+  //
+  // 1-push prologue (rbx unused but pushed for alignment).
+  // ==========================================================================
+  pub let pcc_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-002 (pdxwatch#8): drive all three cases (baseline, click_bar0, toggle) in a stop-on-first-fail sequence. Order matches the scenario progression: baseline (all-compact init state) -> click_bar0 (compact->expanded transition with sub-bar-render witness) -> toggle (idempotent-under-toggle round trip). 1-push prologue (rbx, unused but present for SysV alignment) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. call pcc_case_baseline; cmp rax, 0; jne pcc_ra_done. call pcc_case_click_bar0; cmp rax, 0; jne pcc_ra_done. call pcc_case_toggle. pcc_ra_done: pop rbx; ret. The last-call return value inherits into rax on the fall-through (matches shell tsm_run_all shape at paideia-os/shell#14). Encoder discipline: no `test` (cmp reg, 0 form), no imul, no imm64 in cmp/and. Label pcc_ra_done prefixed pcc_.",
+      block: {
+        push rbx;
+
+        call pcc_case_baseline;
+        cmp rax, 0;
+        jne pcc_ra_done;
+
+        call pcc_case_click_bar0;
+        cmp rax, 0;
+        jne pcc_ra_done;
+
+        call pcc_case_toggle;
+
+        pcc_ra_done:
+        pop rbx;
+        ret
+      }
+    }
+
+}

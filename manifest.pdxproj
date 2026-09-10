@@ -91,8 +91,26 @@ deps:
 # src/collectors.pdx §Error band:
 #   collect_tick fingerprint         0xFFFFE2F0..0xFFFFE2FF   (M4-001)
 tests:
-  # (empty at M1-001; M4-001 adds tests/seeded_stat_smoke.pdx once
-  # the KIND_SYS_STAT seeding primitive lands cross-repo)
+  - tests/test_click_cycle_smoke.pdx   # M4-002 (pdxwatch#8): click-cycle
+                                       # encoder-half smoke -- state machine
+                                       # + scripted-click witness. Lands
+                                       # ahead of M3-001 (blocked on
+                                       # libpdx-event.M3) so the transition
+                                       # contract (compact <-> expanded
+                                       # cycle, sub-bar render witness,
+                                       # idempotent-under-toggle) is
+                                       # testable at every build; the
+                                       # M3-001 substrate wire-in
+                                       # (event_next -> pcc_state_click)
+                                       # is deferred, but this module's
+                                       # pcc_run_all() gates the paideia-os
+                                       # QEMU smoke that emits the
+                                       # 'pdxwatch click-cycle ok'
+                                       # serial-console fingerprint.
+  # (M4-001 seeded-stat smoke lands as tests/test_seeded_stat_smoke.pdx
+  # once the KIND_SYS_STAT seeding primitive lands cross-repo)
+  # (M4-003 keyboard-quit smoke lands as tests/test_keyboard_quit_smoke.pdx
+  # once M3-001's 'q' keydown handler lands)
 
 # --- Documentation targets ---------------------------------------------
 # .pdxdoc file(s) shipped at M5 packaging time.

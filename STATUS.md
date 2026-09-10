@@ -23,7 +23,7 @@ issue breakdown.
 | M2-003 | Network sparkline widget | pending libpdx-gfx M2 |
 | M3-001 | Click-cycle CPU detail + `q` quit | pending libpdx-event M3 |
 | M4-001 | Seeded-stat render smoke witness | pending M2 |
-| M4-002 | Click-cycle smoke | pending M3 |
+| M4-002 | Click-cycle smoke | **encoder-half landed 2026-09-09 (pdxwatch#8); substrate pending M3-001** |
 | M4-003 | `q`-quit smoke | pending M3 |
 | M5-001 | Signed 1.0.0 release | pending M4 |
 | v1.1-B | `SysStatRecord@0.1` semantic-pipe emission wire (pdxwatch#12) | **landed 2026-09-08** |
@@ -122,6 +122,60 @@ Changes:
 - Fingerprint: pdxwatch's console/render surface is unchanged.
   The semantic pipe is an out-of-band structured emit channel; no
   duplicate write of any terminal / KIND_SURFACE payload.
+
+## M4-002 "click-cycle encoder-half smoke" landing details (pdxwatch#8)
+
+The R102.M4-002 issue names the click-cycle CPU-bar detail-mode
+transition smoke: scripted-click into CPU bar #0 should flip its
+detail mode from compact to expanded, and a subsequent render pass
+should observe sub-bar rendering. The full smoke depends on M3-001
+(click-cycle + `q` quit input handler), which blocks on libpdx-event
+M3 (`event_subscribe` / `event_next` wrappers) and is not yet landed.
+
+This landing adopts the shell.M4-003 (paideia-os/shell#14)
+"encoder-half smoke ahead of substrate" shape: land the state-machine
+transition CONTRACT as a self-contained encoder-half smoke NOW, and
+let M3-001's substrate wire-in reference this module's transition
+sentinels when it lands.
+
+Changes:
+
+- `tests/test_click_cycle_smoke.pdx` (new, `module TestClickCycleSmoke`):
+  - `_pcc_state` 96-byte in-.bss ClickCycleState fixture (mode
+    array `[0..8]`, click_count, render_pass_count, sub_bars_rendered,
+    reserved growth region).
+  - `pcc_state_init(state_ptr)` -- zero-fills the state.
+  - `pcc_state_click(state_ptr, bar_idx)` -- flips `mode[bar_idx]`
+    via `new = 1 - old` (works for both 0->1 and 1->0 legs since
+    mode is bit-shaped by construction), bumps click_count.
+  - `pcc_state_render(state_ptr)` -- walks every bar; for each
+    expanded bar, bumps sub_bars_rendered (the render-witness that
+    "sub-bar rendering appeared"); bumps render_pass_count.
+  - `pcc_case_baseline()` -- init + render; asserts all-compact,
+    click_count=0, render_pass_count=1, sub_bars_rendered=0.
+  - `pcc_case_click_bar0()` (PRIMARY WITNESS) -- init + click bar 0
+    + render; asserts mode[0]=EXPANDED, every mode[1..8]=COMPACT,
+    click_count=1, sub_bars_rendered=1.
+  - `pcc_case_toggle()` -- init + click bar 0 twice + render;
+    asserts mode[0]=COMPACT (round-trip), click_count=2,
+    sub_bars_rendered=0 (no expanded bars at render time; guards
+    against a stuck-on `mode |= 1` regression).
+  - `pcc_run_all()` -- drives all three cases stop-on-first-fail;
+    returns 0 (PCC_PASS) on all-pass.
+  - Fail-code band: `0xFFFFE2C0..0xFFFFE2CB` (12 sentinels within
+    pdxwatch's `0xFFFFE210..0xFFFFE2FF` reserved headroom per
+    `src/collectors.pdx` §Error band).
+- `manifest.pdxproj` `tests:` block gains
+  `tests/test_click_cycle_smoke.pdx`; forward-declaration comments
+  for the M4-001 seeded-stat smoke and M4-003 keyboard-quit smoke
+  clarify what still awaits.
+- `STATUS.md` M4-002 row flipped from "pending M3" to "encoder-half
+  landed 2026-09-09; substrate pending M3-001".
+
+Fingerprint: `pdxwatch click-cycle ok` (paideia-os smoke script
+serial-console string emitted when `pcc_run_all()` returns 0). Not
+emitted from ring-3 assembly at this landing; the substrate M3-001
++ libpdx-tty write path is a separate downstream milestone.
 
 ## v1.1-C "release closer" landing details (pdxwatch#13)
 
