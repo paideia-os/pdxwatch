@@ -1,0 +1,575 @@
+// tests/test_q_quit_smoke.pdx -- pdxwatch.M4-003 (paideia-os/pdxwatch#9)
+//
+// TestQQuitSmoke module: encoder-half smoke for the 'q'-keypress quit
+// path documented at design/graphics/r102-user-plan.md §2.8 / §4.8
+// R102.M4-003.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Per design/graphics/r102-user-plan.md §2.8 pdxwatch reference app:
+// pdxwatch's Main::main input loop drains keyboard events from
+// libpdx-event and dispatches them to the input handler. A KEYDOWN
+// event carrying the ASCII 'q' (0x71) code raises the quit request:
+// the input handler sets quit_flag=1 on the shared input-state
+// buffer, records exit_status=0 (clean exit), and Main::main observes
+// the flag on its next tick, tears down the surface, and returns from
+// pw_sys_exit with rdi=0. Any other keycode is counted but never
+// raises the quit flag.
+//
+// M4-003 (this landing) is the local build-time smoke that gates the
+// paideia-os QEMU smoke: it exercises the 'q'-quit STATE MACHINE
+// against a scripted keypress sequence and asserts the state
+// transitions match the design contract. If the state machine drifts,
+// the QEMU smoke has no point booting -- the observable "pdxwatch
+// quit ok" fingerprint that a live-guest run produces on serial
+// output is only meaningful when the underlying state machine is
+// intact.
+//
+// The M4-003 issue names three witnesses:
+//
+//   1. Scripted 'q' keypress raises the quit flag (quit_flag == 1)
+//      with a clean exit_status == 0.
+//   2. A non-'q' keypress is COUNTED (key_count increments) but
+//      MUST NOT raise the quit flag (quit_flag stays 0).
+//   3. Baseline: a freshly initialized state has quit_flag=0,
+//      exit_status=0, key_count=0 (so a false-positive quit
+//      raised by init-order contamination is distinguishable
+//      from a real 'q'-quit transition).
+//
+// The fingerprint 'pdxwatch quit ok' the issue names is the serial-
+// console STRING the paideia-os QEMU-side smoke script emits when
+// this module's pqs_run_all() returns 0 (mirroring the
+// test_click_cycle_smoke.pdx (#8) pcc_run_all() shape at pdxwatch's
+// sibling landing). The string is NOT emitted from ring-3 assembly
+// here -- pdxwatch's live KIND_TTY writer path (libpdx-tty) is a
+// separate M3+ substrate; this module returns a fail-code sentinel
+// from the 0xFFFFE2Dx band that the smoke script maps to the "quit
+// ok / failed" verdict.
+//
+// =============================================================================
+// V1.1-STYLE LEAPFROG (M4-003 lands ahead of M3-001)
+// =============================================================================
+//
+// The R102.M4-003 issue lists M3-001 (click-cycle + 'q' quit input
+// handler) as a dependency. M3-001 itself blocks on libpdx-event M3
+// (event_subscribe + event_next wrappers), which is not yet landed
+// in the R102 wave. This encoder-half smoke lands NOW so the state
+// machine's transition contract is testable at every build, even
+// while the substrate (libpdx-event.M3 subscription + input.pdx
+// dispatch) is still deferred. Matches the identical leapfrog
+// pattern already applied to the M4-002 click-cycle smoke (#8).
+//
+// The state machine lives INSIDE this test module (as fixture-scoped
+// pqs_state_* helpers) rather than in src/input.pdx, because M3-001
+// has not yet chosen its own keydown-dispatch shape (a callback,
+// a message-queue drain, or a poll-then-batch pattern all remain
+// open per design/graphics/r102-user-plan.md §3.5 libpdx-event M3
+// note). When M3-001 lands, its src/input.pdx materializes the
+// "real" quit-flag state module and this smoke's pqs_state_* helpers
+// become either (a) direct callers of the real module's entry points
+// (thin wrappers) or (b) retired in favor of a M4-003-successor
+// smoke that drives the real module. Either way, the transition
+// CONTRACT (baseline-clean, 'q'-raises-quit, other-key-counts-only)
+// codified here does not change.
+//
+// =============================================================================
+// STATE LAYOUT (32 bytes, @align(8))
+// =============================================================================
+//
+//   [+0]         quit_flag           (u64)      0 = running, 1 = quit
+//                                               requested. Set by
+//                                               pqs_state_key when it
+//                                               observes an ASCII 'q'
+//                                               (0x71) keycode; cleared
+//                                               only by pqs_state_init.
+//                                               Main::main polls this
+//                                               each tick and exits the
+//                                               dispatch loop when it
+//                                               reads 1.
+//   [+8]         exit_status         (u64)      the sys_exit status the
+//                                               quit request should
+//                                               deliver. Set to 0 (clean
+//                                               exit) alongside the
+//                                               quit_flag=1 store; only
+//                                               meaningful when
+//                                               quit_flag == 1. Reserved
+//                                               for M3-001+ non-zero
+//                                               error-exit cases (e.g.
+//                                               surface-lost recovery).
+//   [+16]        key_count           (u64)      cumulative keypresses
+//                                               processed (across ALL
+//                                               keycodes, quit and
+//                                               non-quit alike); a
+//                                               witness reads this to
+//                                               assert scripted-keypress
+//                                               dispatch actually
+//                                               happened.
+//   [+24]        reserved            (u64)      8 bytes of growth room
+//                                               (per-modifier state,
+//                                               chord accumulator, or
+//                                               a last-keycode ring
+//                                               slot for a M3+ hotkey
+//                                               dispatcher).
+//
+// Sized at 32 bytes so the layout accommodates the M3-001 formal
+// landing without struct-resize churn (the reserved slot swaps to a
+// libpdx-event-side modifier bitmask once event_next() dispatches
+// modifier state alongside keydown, per r102-user-plan.md §3.5 M3
+// modifier-hint deferred item).
+//
+// =============================================================================
+// SCENARIO (the "scripted-'q' keypress" run)
+// =============================================================================
+//
+// Sequence of events M4-003 asserts:
+//
+//   (1) pqs_state_init(state)                -> quit_flag=0,
+//                                               exit_status=0,
+//                                               key_count=0
+//   (2) pqs_state_key(state, 'q'=0x71)       -> quit_flag=1,
+//                                               exit_status=0,
+//                                               key_count=1
+//
+//   (independent run, from a fresh init)
+//   (3) pqs_state_init(state)                -> baseline clean
+//   (4) pqs_state_key(state, 'a'=0x61)       -> quit_flag stays 0,
+//                                               exit_status stays 0,
+//                                               key_count=1
+//
+// The three test cases below (pqs_case_baseline, pqs_case_press_q,
+// pqs_case_press_other) each drive a subset of the scenario against
+// a re-initialized state so the case can be understood in isolation.
+//
+// =============================================================================
+// FAIL CODES (0xFFFFE2Dx band, adjacent to the M4-002 click-cycle
+// band at 0xFFFFE2Cx; both within pdxwatch's headroom of
+// 0xFFFFE210..0xFFFFE2FF reserved for M1-002+ growth per
+// src/collectors.pdx §Error band. Band spans 0xFFFFE2D0..0xFFFFE2DB
+// inclusive = 12 slots; 9 allocated below, 3 slots reserved for
+// M3-001 substrate-side quit-refuse codes at wire-in time.)
+// =============================================================================
+//
+//   0            PQS_PASS                     all cases + assertions passed
+//   0xFFFFE2D0   PQS_FAIL_BASELINE_QUIT       baseline: quit_flag != 0
+//                                             after init
+//   0xFFFFE2D1   PQS_FAIL_BASELINE_STATUS     baseline: exit_status != 0
+//                                             after init
+//   0xFFFFE2D2   PQS_FAIL_BASELINE_KEY        baseline: key_count != 0
+//                                             after init
+//   0xFFFFE2D3   PQS_FAIL_PRESS_Q_QUIT        press_q: quit_flag != 1
+//                                             after 'q' keypress
+//   0xFFFFE2D4   PQS_FAIL_PRESS_Q_STATUS      press_q: exit_status != 0
+//                                             after 'q' keypress
+//   0xFFFFE2D5   PQS_FAIL_PRESS_Q_KEY         press_q: key_count != 1
+//                                             after one keypress
+//   0xFFFFE2D6   PQS_FAIL_PRESS_OTHER_QUIT    press_other: quit_flag != 0
+//                                             after a non-'q' keypress
+//                                             (regression: any-key-quits
+//                                             bug)
+//   0xFFFFE2D7   PQS_FAIL_PRESS_OTHER_STATUS  press_other: exit_status != 0
+//                                             after a non-'q' keypress
+//   0xFFFFE2D8   PQS_FAIL_PRESS_OTHER_KEY     press_other: key_count != 1
+//                                             (keypress was dropped
+//                                             entirely rather than just
+//                                             the quit-flag side-effect)
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestQQuitSmoke`), matches
+//     file basename test_q_quit_smoke.pdx.
+//   - No `test` mnemonic; every zero/one-check via `cmp reg, imm`
+//     (imm8/imm32).
+//   - Every `cmp reg, imm` fits imm32 (<= 0x7FFFFFFF); fail-code
+//     sentinels (0xFFFFE2Dx) appear only in `mov rax, imm` returns
+//     which take the movabs 10-byte form legally. The 'q' keycode
+//     0x71 fits imm8.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all. State
+//     offsets (0/8/16) are literal imm8 in [rdi + N] and [rbx + N]
+//     forms.
+//   - No `and reg, imm64`; no `cmp reg, [mem]` (every compare loads
+//     through a scratch first).
+//   - r11 is scratch (paideia-as reserved); the module does not
+//     touch it.
+//   - `pub let` single-line only (multiline `pub let ="..."` is a
+//     paideia-as pitfall the encoder refuses).
+//   - Every function that issues a nested call rewinds rsp to
+//     rsp%16==0 at the call boundary. Case entries push exactly one
+//     callee-save (rbx) to hold state_ptr across the state-machine
+//     calls; SysV entry rsp%16==8 + 8B push = rsp%16==0 for every
+//     nested call. Identical alignment convention to the sibling
+//     test_click_cycle_smoke.pdx (#8).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `pqs_*`. Substring "loop" avoided defensively (labels use
+//     `_done_` / `_skip_` / `_end_`).
+
+module TestQQuitSmoke = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFE2Dx band; within pdxwatch's headroom of
+  // 0xFFFFE210..0xFFFFE2FF reserved for M1-002+ growth per
+  // src/collectors.pdx §Error band, adjacent to the M4-002 click-
+  // cycle band at 0xFFFFE2Cx).
+  // ==========================================================================
+  pub let PQS_PASS                     : u64 = 0
+  pub let PQS_FAIL_BASELINE_QUIT       : u64 = 0xFFFFE2D0
+  pub let PQS_FAIL_BASELINE_STATUS     : u64 = 0xFFFFE2D1
+  pub let PQS_FAIL_BASELINE_KEY        : u64 = 0xFFFFE2D2
+  pub let PQS_FAIL_PRESS_Q_QUIT        : u64 = 0xFFFFE2D3
+  pub let PQS_FAIL_PRESS_Q_STATUS      : u64 = 0xFFFFE2D4
+  pub let PQS_FAIL_PRESS_Q_KEY         : u64 = 0xFFFFE2D5
+  pub let PQS_FAIL_PRESS_OTHER_QUIT    : u64 = 0xFFFFE2D6
+  pub let PQS_FAIL_PRESS_OTHER_STATUS  : u64 = 0xFFFFE2D7
+  pub let PQS_FAIL_PRESS_OTHER_KEY     : u64 = 0xFFFFE2D8
+
+  // ==========================================================================
+  // State-layout constants (see §STATE LAYOUT above).
+  // ==========================================================================
+  pub let PQS_STATE_BYTES              : u64 = 32
+  pub let PQS_OFF_QUIT_FLAG            : u64 = 0
+  pub let PQS_OFF_EXIT_STATUS          : u64 = 8
+  pub let PQS_OFF_KEY_COUNT            : u64 = 16
+  pub let PQS_QUIT_CLEAR               : u64 = 0
+  pub let PQS_QUIT_SET                 : u64 = 1
+
+  // ==========================================================================
+  // Keycodes. 'q' is ASCII 0x71; 'a' (used by pqs_case_press_other as
+  // a representative non-'q' key) is ASCII 0x61. Both fit imm8; both
+  // fit imm32 for the cmp form.
+  // ==========================================================================
+  pub let PQS_KEY_Q                    : u64 = 0x71
+  pub let PQS_KEY_OTHER                : u64 = 0x61
+
+  // ==========================================================================
+  // Fixture buffer (.bss). Sized at 4 qwords = 32 bytes to match
+  // PQS_STATE_BYTES. Zero-initialized at load; pqs_state_init rewrites
+  // every byte on entry so pre-init contents are irrelevant.
+  // ==========================================================================
+  pub let mut _pqs_state : [u64; 4] = uninit @align(8)
+
+  // ==========================================================================
+  // pqs_state_init(state_ptr) -> u64
+  //
+  // Zero the entire 32-byte state region (quit_flag, exit_status,
+  // key_count, reserved). Always returns 0 (PQS_PASS) at this landing
+  // -- no validation. Leaf function; no pushes.
+  //
+  // Contract:
+  //   rdi = state_ptr    VA of a >=32B QuitState-shaped buffer
+  //   -> rax = 0         always
+  // ==========================================================================
+  pub let pqs_state_init : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-003 (pdxwatch#9): QuitState zero-fill initializer. Contract SysV rdi=state_ptr. Body zeroes the entire 32-byte region [rdi + 0..31] via a qword scan loop (rcx=byte cursor starting at 0, incrementing by 8; loop exits via `cmp rcx, 32; jae pqs_init_zero_end`). Return xor rax, rax (0=PQS_PASS). Zero pushes / pops -- no callee-save touched, no nested call. rdi/rax/rcx are all SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem], no and reg,imm64. Every loop immediate (32, 8, 0) fits imm8. Labels pqs_init_zero_scan / pqs_init_zero_end prefixed pqs_, no reserved-keyword substrings (substring 'loop' avoided; labels use _scan_ / _end_). Leaf.",
+      block: {
+        xor rax, rax;                          // zero fill value
+        xor rcx, rcx;                          // byte cursor = 0
+        pqs_init_zero_scan:
+        cmp rcx, 32;                           // PQS_STATE_BYTES
+        jae pqs_init_zero_end;
+        mov [rdi + rcx], rax;
+        add rcx, 8;
+        jmp pqs_init_zero_scan;
+        pqs_init_zero_end:
+        xor rax, rax;                          // PQS_PASS
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pqs_state_key(state_ptr, keycode) -> u64
+  //
+  // Handle one scripted keypress carrying `keycode`. If keycode == 'q'
+  // (0x71), raise the quit flag (quit_flag=1, exit_status=0). Any other
+  // keycode leaves quit_flag and exit_status untouched. In BOTH branches
+  // key_count is incremented (the counter tracks TOTAL keypresses
+  // processed, not just quit-triggering ones). Always returns 0.
+  //
+  // Contract:
+  //   rdi = state_ptr    VA of a QuitState
+  //   rsi = keycode      ASCII byte in a u64; only the low byte is
+  //                      meaningful. The M3-001 landing that
+  //                      dispatches real event_next() keydowns is
+  //                      responsible for delivering a canonicalized
+  //                      one-byte keycode; this landing does NOT
+  //                      strip high bits.
+  //   -> rax = 0         always
+  //
+  // Leaf; no callee-save touched.
+  // ==========================================================================
+  pub let pqs_state_key : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (keycode: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-003 (pdxwatch#9): scripted-keypress handler. Contract SysV rdi=state_ptr, rsi=keycode. Body first compares keycode against 'q' (0x71): cmp rsi, 0x71; jne pqs_key_not_q. If keycode == 'q', raise quit: mov rax, 1; mov [rdi + 0], rax (quit_flag=1); xor rax, rax; mov [rdi + 8], rax (exit_status=0, clean exit). pqs_key_not_q: unconditionally bump key_count at [rdi + PQS_OFF_KEY_COUNT(16)]: mov rax, [rdi + 16]; add rax, 1; mov [rdi + 16], rax. Return xor rax, rax (PQS_PASS). Zero pushes / pops -- leaf. Encoder discipline: no `test`, no imul, no imm64 in cmp/and (only imm8 constants 0, 1, 8, 16, 0x71), no cmp reg,[mem] (cmp is against imm, not memory). The 0x71 keycode literal fits imm8; the encoder emits the 3-byte cmp r/m64, imm8 form legally. Labels: pqs_key_not_q prefixed pqs_; no reserved-keyword substrings.",
+      block: {
+        // Compare keycode against 'q' (0x71)
+        cmp rsi, 0x71;
+        jne pqs_key_not_q;
+
+        // Raise quit: quit_flag=1, exit_status=0 (clean exit)
+        mov rax, 1;
+        mov [rdi + 0], rax;                    // quit_flag = PQS_QUIT_SET
+        xor rax, rax;
+        mov [rdi + 8], rax;                    // exit_status = 0
+
+        pqs_key_not_q:
+        // Unconditionally bump key_count at [rdi + 16]
+        mov rax, [rdi + 16];
+        add rax, 1;
+        mov [rdi + 16], rax;
+
+        xor rax, rax;                          // PQS_PASS
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pqs_case_baseline() -> u64
+  //
+  // Init state, assert:
+  //   * quit_flag == 0
+  //   * exit_status == 0
+  //   * key_count == 0
+  //
+  // This case establishes that a fresh state has the quit contract
+  // cleared and no phantom keypresses recorded. Without this baseline,
+  // a false-positive from pqs_case_press_q (say, quit_flag was already
+  // 1 from a pre-existing state contamination) would be
+  // indistinguishable from the real 'q'-keypress transition.
+  //
+  // 1-push prologue (rbx=state_ptr) so state_ptr survives the one
+  // nested call (pqs_state_init). SysV rsp%16==8 + 8B push = rsp%16==0
+  // at every nested call. rbx also carries state_ptr across the
+  // subsequent memory-load assertions, so the push serves both roles.
+  // ==========================================================================
+  pub let pqs_case_baseline : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-003 (pdxwatch#9): baseline case -- verifies fresh state after init. 1-push callee-save prologue (rbx=state_ptr) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (init): lea rbx, [rip + _pqs_state]; mov rdi, rbx; call pqs_state_init. Phase B (assertions): (1) quit_flag == 0: mov rax, [rbx + 0]; cmp rax, 0; jne pqs_bs_quit_fail. (2) exit_status == 0: mov rax, [rbx + 8]; cmp rax, 0; jne pqs_bs_status_fail. (3) key_count == 0: mov rax, [rbx + 16]; cmp rax, 0; jne pqs_bs_key_fail. Return xor rax, rax (PQS_PASS). Encoder discipline: no `test`, no imul, no imm64 in cmp, no cmp reg,[mem] (state loaded to rax first). Labels pqs_bs_* prefixed pqs_; no reserved-keyword substrings. Fail returns each carry a distinct 0xFFFFE2Dx sentinel so an operator reading a test log can distinguish which assertion caught the drift.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _pqs_state];
+
+        // Phase A: init
+        mov rdi, rbx;
+        call pqs_state_init;
+
+        // Phase B-1: assert quit_flag == 0
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne pqs_bs_quit_fail;
+
+        // Phase B-2: assert exit_status == 0
+        mov rax, [rbx + 8];
+        cmp rax, 0;
+        jne pqs_bs_status_fail;
+
+        // Phase B-3: assert key_count == 0
+        mov rax, [rbx + 16];
+        cmp rax, 0;
+        jne pqs_bs_key_fail;
+
+        xor rax, rax;                          // PQS_PASS
+        pop rbx;
+        ret;
+
+        pqs_bs_quit_fail:
+        mov rax, 0xFFFFE2D0;                   // PQS_FAIL_BASELINE_QUIT
+        pop rbx;
+        ret;
+
+        pqs_bs_status_fail:
+        mov rax, 0xFFFFE2D1;                   // PQS_FAIL_BASELINE_STATUS
+        pop rbx;
+        ret;
+
+        pqs_bs_key_fail:
+        mov rax, 0xFFFFE2D2;                   // PQS_FAIL_BASELINE_KEY
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pqs_case_press_q() -> u64
+  //
+  // Init state, scripted 'q' keypress (0x71), assert:
+  //   * quit_flag == 1                    -- quit raised
+  //   * exit_status == 0                  -- clean exit contract
+  //   * key_count == 1                    -- keypress was counted
+  //
+  // THIS IS THE PRIMARY M4-003 WITNESS: the 'q'-keypress -> quit-exit
+  // transition, with the exit_status=0 clean-exit contract.
+  //
+  // 1-push prologue (rbx=state_ptr) so state_ptr survives the two
+  // nested calls (pqs_state_init, pqs_state_key).
+  // ==========================================================================
+  pub let pqs_case_press_q : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-003 (pdxwatch#9) PRIMARY WITNESS: scripted 'q' keypress raises quit flag. 1-push callee-save prologue (rbx=state_ptr) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (init): lea rbx, [rip + _pqs_state]; mov rdi, rbx; call pqs_state_init. Phase B (press 'q'): mov rdi, rbx; mov rsi, 0x71 (PQS_KEY_Q); call pqs_state_key. Phase C (assertions): (1) quit_flag == 1: mov rax, [rbx + 0]; cmp rax, 1; jne pqs_pq_quit_fail. (2) exit_status == 0: mov rax, [rbx + 8]; cmp rax, 0; jne pqs_pq_status_fail. (3) key_count == 1: mov rax, [rbx + 16]; cmp rax, 1; jne pqs_pq_key_fail. Return PQS_PASS. If ANY assertion fails, this case returns a distinct 0xFFFFE2Dx sentinel and the paideia-os smoke script emits 'pdxwatch quit FAILED at <sentinel>' instead of 'pdxwatch quit ok' on serial output. Encoder discipline: same as pqs_case_baseline; the 0x71 keycode immediate fits imm32 for the `mov rsi, 0x71` form. Labels pqs_pq_* prefixed pqs_.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _pqs_state];
+
+        // Phase A: init
+        mov rdi, rbx;
+        call pqs_state_init;
+
+        // Phase B: scripted 'q' keypress
+        mov rdi, rbx;
+        mov rsi, 0x71;                         // PQS_KEY_Q
+        call pqs_state_key;
+
+        // Phase C-1: assert quit_flag == 1
+        mov rax, [rbx + 0];
+        cmp rax, 1;
+        jne pqs_pq_quit_fail;
+
+        // Phase C-2: assert exit_status == 0
+        mov rax, [rbx + 8];
+        cmp rax, 0;
+        jne pqs_pq_status_fail;
+
+        // Phase C-3: assert key_count == 1
+        mov rax, [rbx + 16];
+        cmp rax, 1;
+        jne pqs_pq_key_fail;
+
+        xor rax, rax;                          // PQS_PASS
+        pop rbx;
+        ret;
+
+        pqs_pq_quit_fail:
+        mov rax, 0xFFFFE2D3;                   // PQS_FAIL_PRESS_Q_QUIT
+        pop rbx;
+        ret;
+
+        pqs_pq_status_fail:
+        mov rax, 0xFFFFE2D4;                   // PQS_FAIL_PRESS_Q_STATUS
+        pop rbx;
+        ret;
+
+        pqs_pq_key_fail:
+        mov rax, 0xFFFFE2D5;                   // PQS_FAIL_PRESS_Q_KEY
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pqs_case_press_other() -> u64
+  //
+  // Init state, scripted non-'q' keypress ('a' = 0x61), assert:
+  //   * quit_flag == 0                    -- quit NOT raised
+  //   * exit_status == 0                  -- untouched
+  //   * key_count == 1                    -- keypress was still counted
+  //
+  // This case proves the quit dispatch is 'q'-SPECIFIC, not any-key-
+  // quits. A naive `if keycode != 0: quit` implementation (a
+  // plausible regression for a stub that forgot the 'q' compare) would
+  // pass pqs_case_press_q -- 'q' is non-zero, so the flag would still
+  // be set -- but would fail here (an 'a' keypress would spuriously
+  // raise quit). The assertion (3) that key_count reached 1 also
+  // guards against the opposite regression: a handler that early-
+  // returns on non-'q' keys BEFORE incrementing the counter.
+  //
+  // 1-push prologue (rbx=state_ptr).
+  // ==========================================================================
+  pub let pqs_case_press_other : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-003 (pdxwatch#9): non-'q' keypress case -- verifies the quit dispatch is 'q'-specific, not any-key-quits. 1-push callee-save prologue (rbx=state_ptr) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (init): lea rbx, [rip + _pqs_state]; mov rdi, rbx; call pqs_state_init. Phase B (press 'a'=0x61, a representative non-'q' key): mov rdi, rbx; mov rsi, 0x61 (PQS_KEY_OTHER); call pqs_state_key. Phase C (assertions): (1) quit_flag == 0 (quit NOT raised): mov rax, [rbx + 0]; cmp rax, 0; jne pqs_po_quit_fail. (2) exit_status == 0 (untouched): mov rax, [rbx + 8]; cmp rax, 0; jne pqs_po_status_fail. (3) key_count == 1 (keypress was still counted -- guards against an early-return-before-bump regression): mov rax, [rbx + 16]; cmp rax, 1; jne pqs_po_key_fail. Return PQS_PASS. Encoder discipline: same as pqs_case_baseline. Labels pqs_po_* prefixed pqs_.",
+      block: {
+        push rbx;
+
+        lea rbx, [rip + _pqs_state];
+
+        // Phase A: init
+        mov rdi, rbx;
+        call pqs_state_init;
+
+        // Phase B: scripted non-'q' keypress ('a' = 0x61)
+        mov rdi, rbx;
+        mov rsi, 0x61;                         // PQS_KEY_OTHER
+        call pqs_state_key;
+
+        // Phase C-1: assert quit_flag == 0
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        jne pqs_po_quit_fail;
+
+        // Phase C-2: assert exit_status == 0
+        mov rax, [rbx + 8];
+        cmp rax, 0;
+        jne pqs_po_status_fail;
+
+        // Phase C-3: assert key_count == 1
+        mov rax, [rbx + 16];
+        cmp rax, 1;
+        jne pqs_po_key_fail;
+
+        xor rax, rax;                          // PQS_PASS
+        pop rbx;
+        ret;
+
+        pqs_po_quit_fail:
+        mov rax, 0xFFFFE2D6;                   // PQS_FAIL_PRESS_OTHER_QUIT
+        pop rbx;
+        ret;
+
+        pqs_po_status_fail:
+        mov rax, 0xFFFFE2D7;                   // PQS_FAIL_PRESS_OTHER_STATUS
+        pop rbx;
+        ret;
+
+        pqs_po_key_fail:
+        mov rax, 0xFFFFE2D8;                   // PQS_FAIL_PRESS_OTHER_KEY
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pqs_run_all() -> u64
+  //
+  // Drive all three cases in sequence: baseline, press_q, press_other.
+  // Stop-on-first-fail; return 0 on all-pass. The paideia-os M4+ smoke
+  // harness calls this as a pre-QEMU gate (mirroring the sibling
+  // pcc_run_all() at test_click_cycle_smoke.pdx (#8)); a non-zero
+  // return means the 'q'-quit state machine is broken and the QEMU
+  // smoke's 'pdxwatch quit ok' serial fingerprint would be a lie.
+  //
+  // 1-push prologue (rbx unused but pushed for alignment).
+  // ==========================================================================
+  pub let pqs_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-003 (pdxwatch#9): drive all three cases (baseline, press_q, press_other) in a stop-on-first-fail sequence. Order matches the scenario progression: baseline (clean-init contract) -> press_q ('q'-raises-quit primary witness) -> press_other (quit is 'q'-specific, not any-key). 1-push prologue (rbx, unused but present for SysV alignment) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. call pqs_case_baseline; cmp rax, 0; jne pqs_ra_done. call pqs_case_press_q; cmp rax, 0; jne pqs_ra_done. call pqs_case_press_other. pqs_ra_done: pop rbx; ret. The last-call return value inherits into rax on the fall-through (matches the pcc_run_all shape at pdxwatch#8). Encoder discipline: no `test` (cmp reg, 0 form), no imul, no imm64 in cmp/and. Label pqs_ra_done prefixed pqs_.",
+      block: {
+        push rbx;
+
+        call pqs_case_baseline;
+        cmp rax, 0;
+        jne pqs_ra_done;
+
+        call pqs_case_press_q;
+        cmp rax, 0;
+        jne pqs_ra_done;
+
+        call pqs_case_press_other;
+
+        pqs_ra_done:
+        pop rbx;
+        ret
+      }
+    }
+
+}

@@ -90,6 +90,8 @@ deps:
 # corresponding issue lands. Fail-code family bands for pdxwatch per
 # src/collectors.pdx §Error band:
 #   collect_tick fingerprint         0xFFFFE2F0..0xFFFFE2FF   (M4-001)
+#   click-cycle state (pdxwatch#8)   0xFFFFE2C0..0xFFFFE2CB   (M4-002)
+#   'q'-quit state (pdxwatch#9)      0xFFFFE2D0..0xFFFFE2DB   (M4-003)
 tests:
   - tests/test_click_cycle_smoke.pdx   # M4-002 (pdxwatch#8): click-cycle
                                        # encoder-half smoke -- state machine
@@ -107,10 +109,29 @@ tests:
                                        # QEMU smoke that emits the
                                        # 'pdxwatch click-cycle ok'
                                        # serial-console fingerprint.
+  - tests/test_q_quit_smoke.pdx        # M4-003 (pdxwatch#9): 'q'-quit
+                                       # encoder-half smoke -- keypress
+                                       # state machine + scripted 'q'
+                                       # witness. Lands with the same
+                                       # v1.1-style leapfrog as #8: ahead
+                                       # of M3-001 (blocked on libpdx-
+                                       # event.M3), so the transition
+                                       # contract (baseline-clean,
+                                       # 'q'-raises-quit with clean
+                                       # exit_status=0, non-'q' keypress
+                                       # counts but does NOT raise quit)
+                                       # is testable at every build. The
+                                       # M3-001 substrate wire-in
+                                       # (event_next -> pqs_state_key)
+                                       # is deferred, but this module's
+                                       # pqs_run_all() gates the paideia-os
+                                       # QEMU smoke that emits the
+                                       # 'pdxwatch quit ok' serial-console
+                                       # fingerprint. Fail-code band
+                                       # 0xFFFFE2D0..0xFFFFE2DB (adjacent
+                                       # to #8's 0xFFFFE2C0..CB).
   # (M4-001 seeded-stat smoke lands as tests/test_seeded_stat_smoke.pdx
   # once the KIND_SYS_STAT seeding primitive lands cross-repo)
-  # (M4-003 keyboard-quit smoke lands as tests/test_keyboard_quit_smoke.pdx
-  # once M3-001's 'q' keydown handler lands)
 
 # --- Documentation targets ---------------------------------------------
 # .pdxdoc file(s) shipped at M5 packaging time.
