@@ -160,6 +160,53 @@ module Main = structure {
   pub let mut _pw_fb : [u8; 131072] = uninit @align(64)
 
   // ==========================================================================
+  // Quit-request flag (v1.3-A pdxwatch#6). Set to 1 by pw_request_quit
+  // (invoked from src/input.pdx `input_dispatch_key` when the KEYDOWN
+  // dispatch observes ASCII 'q' = 0x71). The Main::main dispatch loop
+  // reads this at the tail of every iteration and jumps to the exit
+  // phase when it observes a non-zero value, retiring the M1-001
+  // bounded-iterate exit trigger (PW_MAIN_TICK_BUDGET) in favor of
+  // user-driven termination. The bounded budget still stands as a
+  // fail-safe upper bound: if the input path never delivers a 'q'
+  // event (e.g. the M3-001 stub returns 0 events forever until the
+  // real libpdx-event wire lands), the loop still terminates after
+  // 32 iterations rather than spinning forever.
+  //
+  // Slot width [u64; 1] rather than [u8; 1] for the same encoder-
+  // safety rationale WidgetCpu's _pwc_detail deviation documents:
+  // qword loads/stores dodge the paideia-as byte-store pitfall
+  // uniformly across every pdxwatch state slot. .bss zero-init
+  // leaves it at 0 (running) on entry.
+  // ==========================================================================
+  pub let mut _pw_quit_requested : [u64; 1] = uninit @align(8)
+
+  // ==========================================================================
+  // pw_request_quit() -> u64
+  //
+  // v1.3-A (pdxwatch#6) M3-001 accessor: set `_pw_quit_requested` to
+  // 1. Called from src/input.pdx `input_dispatch_key` when the KEYDOWN
+  // dispatch observes ASCII 'q'. Idempotent under repeated calls
+  // (already-set stays set; the flag only clears on process restart
+  // via .bss re-init). Leaf function; no callee-save touched, no
+  // nested call.
+  //
+  // Contract:
+  //   (nullary)
+  //   -> rax = 0        always
+  // ==========================================================================
+  pub let pw_request_quit : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): quit-flag accessor. Contract: nullary; stores 1 into _pw_quit_requested[0]. Body: mov rax, 1; mov [rip + _pw_quit_requested], rax; xor rax, rax; ret. Zero pushes / pops -- leaf. Encoder discipline: no `test`, no imul, no imm64 (only imm8 constants 0, 1). Idempotent: repeated calls simply re-store 1; the read-side (Main::main loop tail) sees any non-zero value as quit-requested. rax/rcx are all SysV caller-save.",
+      block: {
+        mov rax, 1;
+        mov [rip + _pw_quit_requested], rax;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // pw_sys_exit(status) -> !
   //
   // Never-returning wrapper around SC+ sysno 60 (sys_exit). rdi is
@@ -315,6 +362,30 @@ module Main = structure {
         mov r9, 32;                                // height
         call net_widget_render;
         pw_main_no_render:
+
+        // v1.3-A (pdxwatch#6): drain any queued input events, then
+        // check the quit-request flag.
+        //
+        // input_poll_events dispatches every pending pointer / keydown
+        // event through src/input.pdx's dispatch table. When
+        // input_dispatch_key observes ASCII 'q' (0x71) it calls
+        // pw_request_quit which sets _pw_quit_requested to 1; the
+        // read below then jumps out of the iterate loop into the
+        // clean-exit phase. Runs on every iteration (not just refresh
+        // iterations) so a click / keypress delivered between refresh
+        // ticks is not sitting in the queue for up to a second.
+        //
+        // The M3-001 stub in src/input.pdx returns 0 events until
+        // libpdx-event's event_next wrapper lands (deferred; see the
+        // dependency-issue filed at wire-in time). While the stub is
+        // in place, the quit-request flag stays 0 and the bounded
+        // iterate budget (PW_MAIN_TICK_BUDGET = 32) is the loop's
+        // sole exit trigger.
+        call input_poll_events;
+        mov rax, [rip + _pw_quit_requested];
+        cmp rax, 0;
+        jne pw_main_iter_end;                      // user quit -> exit
+
         add rbx, 1;
         jmp pw_main_iter_step;
         pw_main_iter_end:

@@ -193,6 +193,19 @@ module WidgetCpu = structure {
 
   // ==========================================================================
   // BGRA8888 colors (see §COLOR GRADIENT).
+  //
+  // v1.3-A (pdxwatch#6): PWC_COLOR_USER / PWC_COLOR_KERNEL added for the
+  // click-cycle expanded-mode sub-bar rendering. Both live in the same
+  // BGRA band as the load-gradient colors above. User = same green as
+  // LOW (a saturated-load compact bar is green when active_pct >= 100,
+  // so the expanded-mode user band matches its compact-mode look at
+  // the low-load end and stays visually calm). Kernel = magenta, chosen
+  // deliberately OUTSIDE the load-gradient hue set (green->yellow->red)
+  // so an operator scanning the widget parses "top band = user, bottom
+  // band = kernel" as two SUBDIVISIONS of the same load quantity, not
+  // as an intensified load band. Retires or narrows to a two-shade
+  // ramp when sys_cpuinfo lands and the per-mode split becomes real
+  // instead of the M3-001 proxy `user_pct = kernel_pct = active_pct/2`.
   // ==========================================================================
   pub let PWC_COLOR_BG               : u64 = 0xFF202020
   pub let PWC_COLOR_TRACK            : u64 = 0xFF404040
@@ -200,6 +213,8 @@ module WidgetCpu = structure {
   pub let PWC_COLOR_MED              : u64 = 0xFF00C0C0
   pub let PWC_COLOR_HIGH             : u64 = 0xFF2020C0
   pub let PWC_COLOR_LABEL            : u64 = 0xFFE0E0E0
+  pub let PWC_COLOR_USER             : u64 = 0xFF20C020   // green (user cycles)
+  pub let PWC_COLOR_KERNEL           : u64 = 0xFFA050D0   // magenta (kernel cycles)
 
   // ==========================================================================
   // Snapshot field offsets (mirror src/collectors.pdx). Named locally so
@@ -227,18 +242,100 @@ module WidgetCpu = structure {
   pub let PWC_FINGERPRINT_LEN        : u64 = 23        // "pdxwatch cpu-widget ok\n"
 
   // ==========================================================================
+  // Detail-mode constants + per-CPU-bar detail state (v1.3-A pdxwatch#6).
+  //
+  // Each bar carries an independent detail flag: 0 = compact (single
+  // load-gradient bar), 1 = expanded (top 4px = user cycles green,
+  // bottom 4px = kernel cycles magenta). The pointer-click dispatch
+  // path (src/input.pdx `input_dispatch_pointer`) computes cpu_idx
+  // from the pointer's y-coord inside the CPU widget rect (bar pitch
+  // 10, first bar at y=0) and calls `cpu_widget_toggle_detail(cpu_idx)`
+  // which flips the u64 slot via `xor 1`.
+  //
+  // Deviation vs the R102.M3-001 issue text's `_pwc_detail : [u8; 8]`
+  // (byte-per-bar) shape: `[u64; 8]` (8-byte-per-bar) is used instead
+  // to match the u64-per-mode convention the sibling M4-002 test
+  // fixture (tests/test_click_cycle_smoke.pdx `modes[0..8] : u64 x 8`)
+  // already committed to, and to avoid the paideia-as encoder's byte-
+  // store pitfall (a bare `mov [mem], al` narrow store silently
+  // widens to REX.W and clobbers 8 bytes; the guarded workaround is
+  // `mov_b [mem], al` which the encoder supports for LOADS via the
+  // `byte-load-zero-then-mov_b` compliance flag but whose store side
+  // is not exercised anywhere in the pdxwatch/postui satellite band
+  // at this landing time). The extra 56 bytes of .bss vs a packed
+  // byte array is trivial and keeps the encoder discipline uniform
+  // across every state-machine module in pdxwatch's tree.
+  // ==========================================================================
+  pub let PWC_DETAIL_COMPACT          : u64 = 0
+  pub let PWC_DETAIL_EXPANDED         : u64 = 1
+
+  // ==========================================================================
   // Widget-owned .bss scratch:
   //   _pwc_fp_emitted            [u8; 8]  one-shot flag: 0=pending, 1=done
   //   _pwc_fp_str                [u8; 32] fingerprint string composed
   //                                       byte-wise on first render
   //   _pwc_prior_total_cpu_ticks [u8; 8]  reserved for sys_cpuinfo landing
   //   _pwc_prior_refresh_count   [u8; 8]  reserved for sys_cpuinfo landing
+  //   _pwc_detail                [u64; 8] per-CPU-bar detail flag (v1.3-A):
+  //                                       0 = compact, 1 = expanded; toggled
+  //                                       by cpu_widget_toggle_detail on
+  //                                       pointer-click in that bar's row.
   // Everything zeroed by .bss loader; no explicit init required.
   // ==========================================================================
   pub let mut _pwc_fp_emitted            : [u8; 8]  = uninit @align(8)
   pub let mut _pwc_fp_str                : [u8; 32] = uninit @align(8)
   pub let mut _pwc_prior_total_cpu_ticks : [u8; 8]  = uninit @align(8)
   pub let mut _pwc_prior_refresh_count   : [u8; 8]  = uninit @align(8)
+  pub let mut _pwc_detail                : [u64; 8] = uninit @align(8)
+
+  // ==========================================================================
+  // cpu_widget_toggle_detail(cpu_idx) -> u64
+  //
+  // v1.3-A (pdxwatch#6) M3-001 accessor: flip `_pwc_detail[cpu_idx]`
+  // between COMPACT (0) and EXPANDED (1). Called from
+  // src/input.pdx `input_dispatch_pointer` on a pointer-button-down
+  // whose y-coord falls inside a CPU-bar row.
+  //
+  // Bounds: cpu_idx in [0, PWC_MAX_CPUS=8); out-of-range indices are
+  // silently ignored (no-op return) so the input dispatcher does not
+  // have to duplicate the check. The toggle is `xor rax, 1` on the
+  // qword slot; since the slot is set/cleared only by this function
+  // and .bss zero-init leaves it at 0, the value is always 0 or 1
+  // and the XOR is functionally identical to the R102.M3-001 issue
+  // text's `xor byte, 1` shape.
+  //
+  // Contract:
+  //   rdi = cpu_idx    caller-verified in [0, PWC_MAX_CPUS)
+  //   -> rax = 0       always (out-of-range indices also return 0)
+  //
+  // Leaf function; no callee-save touched, no nested call. rdi/rax/
+  // rcx/rdx are all SysV caller-save and safe as scratch.
+  // ==========================================================================
+  pub let cpu_widget_toggle_detail : (u64) -> u64 !{mem} @{} =
+    fn (cpu_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): per-CPU-bar detail toggle. Contract SysV rdi=cpu_idx. Body first bounds-checks cpu_idx < PWC_MAX_CPUS (8): cmp rdi, 8; jae pwc_td_skip. Compute _pwc_detail[cpu_idx] address = _pwc_detail + cpu_idx*8 (u64-per-bar stride, deviation from issue text's [u8;8] documented at §Detail-mode constants): mov rax, rdi; shl rax, 3; lea rcx, [rip + _pwc_detail]; add rcx, rax. Load old flag: mov rax, [rcx + 0]. Flip: xor rax, 1 (works both directions since the slot is set only by this function and .bss zero-init leaves it at 0, so value is always 0 or 1). Store: mov [rcx + 0], rax. Return xor rax, rax (0). Zero pushes / pops -- leaf. Encoder discipline: no `test` (cmp reg, imm8 form for the bounds check), no imul (cpu_idx*8 via shl 3), no imm64 in cmp/and (only imm8 constants 0, 1, 3, 8), no cmp reg,[mem] (load through rax before compare). Labels: pwc_td_skip prefixed pwc_td_ (M3-001 subsystem), no reserved-keyword substrings.",
+      block: {
+        // Bounds: cpu_idx < PWC_MAX_CPUS (8)
+        cmp rdi, 8;
+        jae pwc_td_skip;
+
+        // Compute _pwc_detail[cpu_idx] address (8-byte stride).
+        mov rax, rdi;
+        shl rax, 3;                            // cpu_idx * 8
+        lea rcx, [rip + _pwc_detail];
+        add rcx, rax;
+
+        // Toggle: new = old XOR 1
+        mov rax, [rcx + 0];
+        xor rax, 1;
+        mov [rcx + 0], rax;
+
+        pwc_td_skip:
+        xor rax, rax;                          // always 0
+        ret
+      }
+    }
 
   // ==========================================================================
   // pwc_sys_debug_puts(buf_ptr, count) -> u64
@@ -747,7 +844,48 @@ module WidgetCpu = structure {
         mov r9, 0xFF404040;                       // PWC_COLOR_TRACK
         call pwc_gfx_fill_rect;
 
-        // Draw filled portion (bar_fill_w px, color from slot).
+        // v1.3-A (pdxwatch#6): branch on _pwc_detail[cpu_idx].
+        //   0 = COMPACT  -> single 8-px bar with load-gradient color
+        //   1 = EXPANDED -> top 4-px user (green) + bottom 4-px kernel
+        //                   (magenta), each at bar_fill_w/2 width
+        //                   (proxy: user_pct = kernel_pct = active_pct/2
+        //                   until sys_cpuinfo lands and the split
+        //                   becomes real).
+        mov rax, [rsp + 16];                      // cpu_idx
+        shl rax, 3;                               // cpu_idx * 8
+        lea rdx, [rip + _pwc_detail];
+        add rdx, rax;
+        mov rax, [rdx + 0];                       // detail[cpu_idx]
+        cmp rax, 0;
+        je pwc_cwr_compact;
+
+        // ---- EXPANDED: sub-bar rendering (user + kernel) --------------
+        // User (top 4px, half fill, green).
+        mov rdi, rbx;                             // fb
+        mov rsi, r13;
+        add rsi, 72;                              // bar_x
+        mov rdx, [rsp + 24];                      // row_y (top band)
+        mov rcx, [rsp + 40];                      // bar_fill_w
+        shr rcx, 1;                               // user_w = fill/2
+        mov r8, 4;                                // half height
+        mov r9, 0xFF20C020;                       // PWC_COLOR_USER (green)
+        call pwc_gfx_fill_rect;
+
+        // Kernel (bottom 4px, half fill, magenta).
+        mov rdi, rbx;                             // fb
+        mov rsi, r13;
+        add rsi, 72;                              // bar_x
+        mov rdx, [rsp + 24];                      // row_y
+        add rdx, 4;                               // bottom band at row_y+4
+        mov rcx, [rsp + 40];                      // bar_fill_w
+        shr rcx, 1;                               // kernel_w = fill/2
+        mov r8, 4;                                // half height
+        mov r9, 0xFFA050D0;                       // PWC_COLOR_KERNEL (magenta)
+        call pwc_gfx_fill_rect;
+        jmp pwc_cwr_bar_done;
+
+        // ---- COMPACT: single 8-px filled portion ----------------------
+        pwc_cwr_compact:
         mov rdi, rbx;                             // fb
         mov rsi, r13;
         add rsi, 72;                              // bar_x
@@ -756,6 +894,8 @@ module WidgetCpu = structure {
         mov r8, 8;                                // PWC_BAR_HEIGHT
         mov r9, [rsp + 32];                       // color
         call pwc_gfx_fill_rect;
+
+        pwc_cwr_bar_done:
 
         // ---- Advance to next CPU ------------------------------------------
         mov rax, [rsp + 16];

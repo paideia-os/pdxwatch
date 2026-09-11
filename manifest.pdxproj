@@ -59,8 +59,8 @@ sources:
   - src/widget_cpu.pdx            # M2-001 (pdxwatch#3): CPU bar-per-core widget (with libpdx-gfx/font stubs)
   - src/widget_mem.pdx            # M2-002 (pdxwatch#4): memory tri-color widget (used/cached/free segments, mirrors widget_cpu.pdx stub shape)
   - src/widget_net.pdx            # M2-003 (pdxwatch#5): network sparkline widget (60-sample ring, staircase draw_line stub, mirrors widget_cpu.pdx/widget_mem.pdx stub shape)
+  - src/input.pdx                 # M3-001 (pdxwatch#6): click-cycle detail-toggle + 'q'-quit dispatch (libpdx-event.M3-001 queue drain STUBBED; follow-up wire-in issue tracked separately)
   # - src/argv.pdx                # M1-002: argv parser (deferred; blocks on libpdx-argv v1.1.0 in the same wave)
-  # - src/input.pdx               # M3-001: click-cycle + 'q' quit input handler
   # v1.1-B landed the SysStatRecord@0.1 emit path INSIDE
   # src/collectors.pdx (pw_sys_semantic_send wrapper + Phase D-bis
   # emit block in collect_tick) rather than as a separate

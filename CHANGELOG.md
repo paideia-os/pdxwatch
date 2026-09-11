@@ -9,6 +9,89 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ### Added
 
+- **v1.3-A -- M3-001 click-cycle detail-toggle + 'q'-quit dispatch**
+  (pdxwatch#6).
+  - `src/input.pdx` (new, `module Input`): input-event dispatch
+    surface for the M3 landing. Four `pub let` entries:
+    - `pwi_sys_debug_puts(buf, count)` -- thin SC+ sysno 12 wrapper,
+      identical shape to WidgetCpu's / WidgetMem's / WidgetNet's peer
+      wrappers.
+    - `pwi_emit_fingerprint()` -- one-shot serial-console emit of
+      `pdxwatch input ok\n` (18 bytes) via three qword stores +
+      `_pwi_fp_emitted` gate; matches the widget fingerprint pattern
+      shared across the M2 landings.
+    - `input_dispatch_pointer(y)` -- resolves a screen-space y-coord
+      to a CPU-bar index (`cpu_idx = y / 10` via a subtract-and-count
+      loop; no `imul` / `div`) and calls `cpu_widget_toggle_detail`
+      to flip the per-bar detail flag. y >= 80 (outside the CPU
+      widget rect) is silently ignored; mem/net widget click
+      handlers are deferred to a future round.
+    - `input_dispatch_key(keycode)` -- if keycode == 'q' (0x71),
+      calls `pw_request_quit` to raise the Main-owned quit flag;
+      other keycodes fall through without touching the flag
+      (matches the M4-003 `pqs_state_key` contract at
+      tests/test_q_quit_smoke.pdx#9).
+    - `input_poll_events()` -- **STUB(libpdx-event.M3-001)**: real
+      event_next queue drain pending the libpdx-event M3 landing.
+      At stub, returns 0 (no events dispatched) unconditionally.
+      Marker `STUB(libpdx-event.M3-001)` at the source callsite
+      audit-trails the wire-up point. Follow-up dependency issue
+      ("pdxwatch: retire input.pdx event-queue stub when libpdx-
+      event.M3-001 lands") should be filed against
+      paideia-os/pdxwatch when the library reaches M3.
+  - `src/widget_cpu.pdx`:
+    - New `_pwc_detail : [u64; 8]` .bss slot -- per-CPU-bar detail
+      flag (0 = compact, 1 = expanded). Deviation from the issue
+      text's `[u8; 8]` shape documented at §Detail-mode constants:
+      the u64-per-bar stride matches the sibling M4-002 test
+      fixture (`modes[0..8] : u64 x 8`) and dodges the paideia-as
+      byte-store encoder pitfall uniformly.
+    - New `cpu_widget_toggle_detail(cpu_idx)` accessor: bounds-
+      checks `cpu_idx < 8`, then `xor rax, 1` on the u64 slot.
+      Called from `Input::input_dispatch_pointer` on every CPU-bar
+      click.
+    - New `PWC_DETAIL_COMPACT` / `PWC_DETAIL_EXPANDED` /
+      `PWC_COLOR_USER` (green, `0xFF20C020`) / `PWC_COLOR_KERNEL`
+      (magenta, `0xFFA050D0`) constants.
+    - `cpu_widget_render` Phase D.4 (bar draw): now branches on
+      `_pwc_detail[cpu_idx]`. Compact = single 8-px bar with the
+      load-gradient color (unchanged). Expanded = two stacked
+      sub-bars, top 4-px user (green) + bottom 4-px kernel
+      (magenta), each at `bar_fill_w/2` width. Both sub-bars share
+      the M3-era proxy `user_pct = kernel_pct = active_pct/2`
+      until sys_cpuinfo lands and the split becomes real; the
+      sub-bar rendering shape (top user / bottom kernel, four
+      pixels each, half-fill each) does not change under the
+      sys_cpuinfo landing.
+  - `src/main.pdx`:
+    - New `_pw_quit_requested : [u64; 1]` .bss slot -- quit-request
+      flag polled at the tail of every dispatch-loop iteration.
+    - New `pw_request_quit()` accessor: sets `_pw_quit_requested`
+      to 1. Idempotent under repeated calls. Called from
+      `Input::input_dispatch_key` on ASCII 'q' keydown.
+    - `Main::main` dispatch loop tail: calls `input_poll_events`
+      on every iteration (not just refresh iterations), then reads
+      `_pw_quit_requested`; a non-zero value jumps to the clean-
+      exit phase (`pw_sys_exit(0)`). While the M3-001 stub returns
+      0 events, the quit flag stays 0 and the bounded budget
+      (`PW_MAIN_TICK_BUDGET = 32`) remains the terminal exit
+      trigger; when libpdx-event.M3-001 lands and the stub is
+      retired, the loop terminates on the first 'q' keydown.
+      Shutdown path: the existing `pw_sys_exit(0)` tail-call is
+      the sole cleanup step -- no explicit fb free (backing store
+      is .bss, reclaimed on process teardown by the kernel), no
+      surface teardown (KIND_SURFACE not minted until M1-002).
+      A closing serial fingerprint on quit is deferred to a
+      future round that wires surface revoke + explicit cleanup.
+  - `manifest.pdxproj`: `sources:` block promotes `src/input.pdx`
+    from commented forward-declaration to live entry.
+  - `caps.decl`: no change at this landing. The follow-up
+    libpdx-event.M3-001 wire-in will add `sys_ipc_recv @ 40`
+    when the queue-drain body materializes; `sys_debug_puts @ 12`
+    (already declared for the M2 widget fingerprints) covers the
+    `pdxwatch input ok` emit shared by the two dispatch entries.
+  - Closes #6.
+
 - **v1.2-C -- M2-003 network sparkline widget** (pdxwatch#5).
   - `src/widget_net.pdx` (new, `module WidgetNet`): per-interface
     bytes/s sparkline render widget. Maintains a fixed-size circular

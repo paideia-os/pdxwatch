@@ -1,0 +1,479 @@
+// src/input.pdx -- pdxwatch.M3-001 (paideia-os/pdxwatch#6)
+//
+// Input module: pointer-click and 'q'-keypress dispatch for the M3
+// input-handling landing.
+//
+// =============================================================================
+// SCOPE  (design/graphics/r102-user-plan.md §4.8 R102.M3-001)
+// =============================================================================
+//
+// Subscribes to the libpdx-event compositor input channel and drives
+// the two user-input paths pdxwatch's M3 milestone names:
+//
+//   POINTER_BUTTON_DOWN inside a CPU-bar rect -> flip that bar's
+//                                                detail flag (compact
+//                                                <-> expanded). The
+//                                                dispatch computes
+//                                                cpu_idx from the
+//                                                pointer's y-coord
+//                                                using the CPU widget's
+//                                                known row layout
+//                                                (y0=0, PWC_BAR_ROW_PITCH
+//                                                = 10, PWC_MAX_CPUS = 8)
+//                                                and calls WidgetCpu::
+//                                                cpu_widget_toggle_detail
+//                                                which flips the
+//                                                per-bar flag via
+//                                                `xor rax, 1`.
+//
+//   KEYDOWN 'q' (0x71)                        -> set the Main-owned
+//                                                _pw_quit_requested
+//                                                flag via Main::
+//                                                pw_request_quit;
+//                                                Main::main's dispatch
+//                                                loop observes the
+//                                                flag at its tail and
+//                                                clean-exits.
+//
+// Emits the serial-console fingerprint 'pdxwatch input ok' once on
+// the first successfully-dispatched input event (via SC+ sysno 12
+// sys_debug_puts). A boot smoke that runs pdxwatch under QEMU can
+// grep the serial console for this string to gate M3-001 "input
+// path wired and firing" verification, just as the M2 widgets emit
+// 'pdxwatch cpu-widget ok' / 'mem-widget ok' / 'net-widget ok'.
+//
+// =============================================================================
+// LIBPDX-EVENT M3-001 STUB (INPUT_POLL_EVENTS)
+// =============================================================================
+//
+// The R102.M3-001 issue lists libpdx-event.M3-001 (`event_subscribe`
+// + `event_next` wrappers on top of SC+ sysno 40 `sys_ipc_recv`) as
+// a prerequisite. Neither libpdx-event's M3 landing nor an
+// event_subscribe surface exists in the paideia-os monorepo at this
+// landing time. Rather than block the entire M3 wave on the library
+// landing, this module ships an INLINE STUB for the event-queue
+// drain:
+//
+//   pwi_gfx_event_next(out_type_ptr, out_arg_ptr) -> u64   (unused / stub)
+//
+// (The stub is not even a wrapper -- `input_poll_events` below
+// short-circuits directly to a "no events pending" return code.
+// The real event_next signature lives at the R102 wave-ordering
+// table under §3.5 libpdx-event M3; the M3-001 wire-in follow-up
+// swaps `input_poll_events`'s body to drain the queue and route
+// each event through the two dispatch entries below.)
+//
+// The dispatch entries (`input_dispatch_pointer`, `input_dispatch_key`)
+// are exported PUBLIC so:
+//
+//   (a) the follow-up libpdx-event wire-in has a stable entry point
+//       to call from its event_next loop;
+//   (b) the paideia-os M4-002 click-cycle smoke (tests/test_click_
+//       cycle_smoke.pdx pdxwatch#8) and the M4-003 'q'-quit smoke
+//       (tests/test_q_quit_smoke.pdx pdxwatch#9) can swap out their
+//       fixture-owned state helpers for direct calls to these two
+//       dispatch entries at their M3-001-follow-up landing without
+//       reshuffling the smoke's assertion contract.
+//
+// Follow-up dependency issue (title: "pdxwatch: retire input.pdx
+// event-queue stub when libpdx-event.M3-001 lands") should be filed
+// in paideia-os/pdxwatch when the libpdx-event.M3 landing opens the
+// event_subscribe wire. Marker `// STUB(libpdx-event.M3-001)` at
+// the callsite audit-trails the wire-up point.
+//
+// =============================================================================
+// CPU BAR HIT-TEST (COORDINATE TRANSLATION)
+// =============================================================================
+//
+// The pointer-dispatch path receives a screen-space y-coord and must
+// resolve it to a CPU-bar row index. The CPU widget's rect at the
+// M2-001 landing is (x0=0, y0=0, w=256, h=80) with per-bar pitch 10
+// (PWC_BAR_ROW_PITCH), so `cpu_idx = y / 10` for y in [0, 80).
+//
+// The M1-era pointer path is single-widget: any y in [0, 80) is a CPU-
+// bar click, y in [80, 128) falls in the mem/net widget regions and
+// is silently ignored (no per-widget click handler wired at M3-001).
+// The M2-002/M2-003 landings for mem/net widget click-cycle handlers
+// are DEFERRED per the same design/graphics/r102-user-plan.md §2.8
+// note that split "M2 widgets: render only" from "M3 widgets: input-
+// bound behaviors".
+//
+// The `y / 10` division is computed via a subtract-and-count loop
+// (y is bounded to 0..79 so the loop runs at most 8 iterations)
+// rather than an `imul` / `div` sequence -- paideia-as encoder G0
+// (`no imul`, `no mul`, `no div`) bans both mnemonics defensively;
+// the subtract loop is O(cpu_idx) and encoder-safe.
+//
+// =============================================================================
+// FINGERPRINT (SC+ sysno 12 sys_debug_puts)
+// =============================================================================
+//
+// The R102.M3-001 issue names the observable serial-console fingerprint
+// 'pdxwatch input ok'. Emitted through sys_debug_puts (sysno 12, the
+// same kernel-owned debug channel every widget's fingerprint emitter
+// uses) on the FIRST successfully-dispatched input event (both
+// dispatch entries fire the emit; the shared `_pwi_fp_emitted` flag
+// gates re-emission so subsequent clicks/keypresses do not spam the
+// serial console). A KEYDOWN of any keycode -- not just 'q' -- counts
+// as a "successfully dispatched" event and flips the emit gate; the
+// gate observes the input pipeline is live, not the 'q' branch in
+// particular.
+//
+// The 18-byte fingerprint string ("pdxwatch input ok\n") is composed
+// at runtime by three qword stores into `_pwi_fp_str` on the first
+// dispatch call -- avoiding a `pub let str : [u8; N] = "..."` literal,
+// which the encoder's single-line pub let discipline supports but
+// which the pdxwatch scaffold uniformly composes byte-wise (see
+// src/widget_cpu.pdx `pwc_emit_fingerprint` for the identical
+// pattern; every widget's fingerprint emitter uses the same 3-store
+// layout).
+//
+// =============================================================================
+// MODULE NAME DEVIATION
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag requires
+// module name = file basename PascalCased. File `input.pdx` ->
+// module `Input`. Cross-module callers (Main::main -> input_poll_
+// events; libpdx-event.M3-001 wire-in -> input_dispatch_pointer /
+// input_dispatch_key) invoke this surface through the four `pub let`
+// entry points below.
+//
+// `Input` is not a reserved paideia-as keyword (the reserved set
+// listed under `feedback_paideia_as_reserved_labels` names `loop`,
+// `if`, `then`, `else`, `test`; `input` is not among them). The
+// module namespace stays clean.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Input`).
+//   - No `test` mnemonic; every zero/one-check via `cmp reg, imm`.
+//   - Every immediate in cmp/and fits imm32 (<= 0x7FFFFFFF). The
+//     'q' keycode 0x71 fits imm8; every other constant (10, 80, 8)
+//     fits imm8 too.
+//   - No `imul` mnemonic at all; no `mul`; no `div`. The y/10
+//     division is a subtract-and-count loop.
+//   - r11 is scratch (paideia-as reserved -- never touched).
+//   - SysV alignment: every nested-call function pushes an ODD
+//     count of 8-byte callee-save registers (or an even count + one
+//     pad push) so `rsp % 16 == 0` at every call boundary.
+//   - `pub let` single-line declarations only.
+//   - Labels prefixed `pwi_*` (input subsystem); reserved keyword
+//     substrings (`loop`, `if`, `then`, `else`, `test`) NEVER appear
+//     as labels. Substring "loop" avoided defensively (labels use
+//     `_step_` / `_end_` / `_done_` / `_skip_`).
+//   - Every unsafe-bodied lambda has <= 6 params (encoder B1708
+//     ceiling). Every entry point declares `capabilities: {}` (per
+//     paideia-as 0.36 unsafe-body shape requirement).
+
+module Input = structure {
+
+  // ==========================================================================
+  // Event-type constants. Named for the follow-up libpdx-event wire-in
+  // that will call these dispatch entries from its event_next drain.
+  // ==========================================================================
+  pub let PWI_EVENT_NONE                : u64 = 0
+  pub let PWI_EVENT_POINTER_BUTTON_DOWN : u64 = 1
+  pub let PWI_EVENT_KEYDOWN             : u64 = 2
+
+  // ==========================================================================
+  // CPU widget layout constants (mirror WidgetCpu -- named locally so
+  // input code reads without cross-module import churn). Kept in sync
+  // with the constants of the same shape at src/widget_cpu.pdx; if
+  // WidgetCpu's PWC_BAR_ROW_PITCH ever changes, this module's copy
+  // must move in lockstep (a grep-driven audit is the maintenance
+  // discipline until paideia-as adds cross-module const import).
+  // ==========================================================================
+  pub let PWI_CPU_Y0                    : u64 = 0
+  pub let PWI_CPU_BAR_PITCH             : u64 = 10
+  pub let PWI_CPU_HEIGHT                : u64 = 80
+  pub let PWI_MAX_CPUS                  : u64 = 8
+
+  // ==========================================================================
+  // Keycodes. 'q' is ASCII 0x71; fits imm8, fits imm32 for the cmp
+  // form. Only 'q' has a behavior wired at M3-001; every other keycode
+  // still counts as a dispatched event (bumps the fingerprint gate
+  // one-shot) but otherwise no-ops.
+  // ==========================================================================
+  pub let PWI_KEY_Q                     : u64 = 0x71
+
+  // ==========================================================================
+  // SC+ syscall constants + fingerprint length.
+  // "pdxwatch input ok\n" = 18 bytes.
+  // ==========================================================================
+  pub let PWI_SYS_DEBUG_PUTS            : u64 = 12
+  pub let PWI_FINGERPRINT_LEN           : u64 = 18
+
+  // ==========================================================================
+  // Module-owned .bss scratch:
+  //   _pwi_fp_emitted   [u8; 8]  one-shot gate: 0=pending, 1=done
+  //   _pwi_fp_str       [u8; 24] fingerprint string composed byte-wise
+  //                              on first dispatch call (18 bytes payload
+  //                              + 6 bytes NUL pad to fill three qwords)
+  // Everything zeroed by .bss loader; no explicit init required.
+  // ==========================================================================
+  pub let mut _pwi_fp_emitted : [u8; 8]  = uninit @align(8)
+  pub let mut _pwi_fp_str     : [u8; 24] = uninit @align(8)
+
+  // ==========================================================================
+  // pwi_sys_debug_puts(buf_ptr, count) -> u64
+  //
+  // Thin wrapper around SC+ sysno 12 (sys_debug_puts). Identical shape
+  // to WidgetCpu's `pwc_sys_debug_puts` (and WidgetMem's /
+  // WidgetNet's peers); the kernel dispatch is idempotent across all
+  // four callsites. Emits `count` bytes from user VA `buf_ptr` to
+  // the kernel-owned debug channel (bypasses fd routing --
+  // design/user/syscall-table.md row 12).
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2 < 4). Leaf.
+  // ==========================================================================
+  pub let pwi_sys_debug_puts : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (buf_ptr: u64) (count: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): SC+ sysno 12 (sys_debug_puts) wrapper. SysV rdi=buf_ptr / rsi=count pass through unchanged to SYSCALL rdi/rsi. mov rax, 12; syscall; ret. Kernel-owned debug channel (bypasses fd routing) -- design/user/syscall-table.md row 12. Sole consumer: pwi_emit_fingerprint below, which fires exactly once on the first successfully-dispatched input event. Leaf: rcx/r11 SYSCALL-clobbered (both SysV caller-save). Identical body to WidgetCpu's / WidgetMem's / WidgetNet's peer wrappers.",
+      block: {
+        mov rax, 12;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwi_emit_fingerprint() -> u64
+  //
+  // One-shot fingerprint emission. Composes "pdxwatch input ok\n"
+  // (18 bytes) into _pwi_fp_str via three qword stores, then calls
+  // pwi_sys_debug_puts. Guarded by _pwi_fp_emitted (0 -> emit + set,
+  // 1 -> skip). Returns 1 on emit, 0 on skip.
+  //
+  // ASCII qword encoding (little-endian):
+  //   [+0]  "pdxwatch"    = 0x68_63_74_61_77_78_64_70
+  //                          (identical to every widget's fingerprint
+  //                          module -- shared string prefix)
+  //   [+8]  " input o"    = 0x6f_20_74_75_70_6e_69_20
+  //                          (SP i n p u t SP o, LE byte order)
+  //   [+16] "k\n" + 6*NUL = 0x00_00_00_00_00_00_0a_6b
+  //                          (only bytes [+16..+17] are payload; the
+  //                          6-byte NUL pad exists solely so the third
+  //                          qword store is well-formed. The emit call
+  //                          uses count=18, so the NUL padding is not
+  //                          written to the debug channel.)
+  //
+  // 3-push prologue (rbx / r12 unused but reserved / rax pad) = 24B.
+  // Entry rsp %16==8; +24 = rsp%16==0 for the pwi_sys_debug_puts call.
+  // ==========================================================================
+  pub let pwi_emit_fingerprint : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): one-shot 'pdxwatch input ok\\n' emit via SC+ sysno 12 sys_debug_puts. Guard: mov rax, [rip + _pwi_fp_emitted]; cmp rax, 0; jne pwi_fp_skip. Compose: three qword stores into _pwi_fp_str encoding the 18-byte string as three ASCII LE qwords (payload = 18 bytes; the third qword's trailing 6 bytes are NUL pad, not emitted since sys_debug_puts takes count=18). Emit: lea rdi, [rip + _pwi_fp_str]; mov rsi, 18; call pwi_sys_debug_puts. Mark: mov rax, 1; mov [rip + _pwi_fp_emitted], rax. Return 1 (emitted) or 0 (skipped). Register plan: 3 pushes (rbx / r12 unused but reserved for alignment shape uniformity with the peer widgets' emitters / rax pad) = 24B -> SysV rsp%16==8 + 24 = rsp%16==0 for the nested call. Encoder discipline: no `test` (cmp rax, 0 form), no imul, every immediate fits imm8 (0, 1, 18) except the three 8-byte ASCII qwords (which use mov reg, imm's movabs form -- legal for mov). Labels pwi_fp_skip / pwi_fp_done prefixed pwi_fp_; no reserved-keyword substrings.",
+      block: {
+        push rbx;
+        push r12;                                 // reserved (unused, shape uniformity)
+        push rax;                                 // pad -> %16==0
+
+        // Guard: skip if already emitted.
+        mov rax, [rip + _pwi_fp_emitted];
+        cmp rax, 0;
+        jne pwi_fp_skip;
+
+        // Compose 18-byte string into _pwi_fp_str.
+        // "pdxwatch": p(70) d(64) x(78) w(77) a(61) t(74) c(63) h(68)
+        //             LE qword = 0x68_63_74_61_77_78_64_70
+        mov rax, 0x6863746177786470;
+        mov [rip + _pwi_fp_str + 0], rax;
+        // " input o": SP(20) i(69) n(6e) p(70) u(75) t(74) SP(20) o(6f)
+        //             LE qword = 0x6f_20_74_75_70_6e_69_20
+        mov rax, 0x6f207475706e6920;
+        mov [rip + _pwi_fp_str + 8], rax;
+        // "k\n" + 6*NUL: k(6b) LF(0a) NUL x 6
+        //                LE qword = 0x00_00_00_00_00_00_0a_6b
+        mov rax, 0x0000000000000a6b;
+        mov [rip + _pwi_fp_str + 16], rax;
+
+        // Emit via sys_debug_puts.
+        lea rdi, [rip + _pwi_fp_str];
+        mov rsi, 18;                              // PWI_FINGERPRINT_LEN
+        call pwi_sys_debug_puts;
+
+        // Mark emitted.
+        mov rax, 1;
+        mov [rip + _pwi_fp_emitted], rax;
+
+        // Return 1 (emitted).
+        mov rax, 1;
+        jmp pwi_fp_done;
+
+        pwi_fp_skip:
+        xor rax, rax;
+
+        pwi_fp_done:
+        pop rcx;                                  // discard pad
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // input_dispatch_pointer(y) -> u64
+  //
+  // Resolve a POINTER_BUTTON_DOWN screen-space y-coord to a CPU-bar
+  // index and toggle that bar's detail flag. y-coords outside the CPU
+  // widget's rect (y >= PWI_CPU_HEIGHT = 80) are silently ignored;
+  // the M2-002/M2-003 landings for mem/net widget click handlers are
+  // deferred at M3-001 per the design note above.
+  //
+  // Fires the fingerprint (one-shot) on every dispatched pointer
+  // event, including no-op y-coords -- the fingerprint tracks "input
+  // pipeline delivered an event", not "widget state changed".
+  //
+  // Contract:
+  //   rdi = y             screen-space y-coord (>= 0). Only y-coords
+  //                       in [0, PWI_CPU_HEIGHT) route to a bar
+  //                       toggle; other y values fall through to the
+  //                       fingerprint emit + return.
+  //   -> rax = 0          always
+  //
+  // Register plan: 1-push callee-save (rbx unused but pushed for
+  // alignment) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every
+  // nested call (cpu_widget_toggle_detail, pwi_emit_fingerprint).
+  // ==========================================================================
+  pub let input_dispatch_pointer : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (y: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): pointer-click dispatch. Contract SysV rdi=y (screen-space y-coord). 1-push callee-save prologue (rbx unused but pushed for alignment) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A (bounds): cmp rdi, 80 (PWI_CPU_HEIGHT); jae pwi_dp_no_bar (y outside CPU widget -- fall through to fingerprint emit only). Phase B (y/10 division): xor rcx, rcx (cpu_idx=0); mov rax, rdi; pwi_dp_div_step: cmp rax, 10 (PWI_CPU_BAR_PITCH); jb pwi_dp_div_end; sub rax, 10; add rcx, 1; jmp pwi_dp_div_step. pwi_dp_div_end: cpu_idx in rcx. Sanity: cmp rcx, 8; jae pwi_dp_no_bar (should never trigger given the y<80 bound, but defensive). Phase C (toggle): mov rdi, rcx; call cpu_widget_toggle_detail (WidgetCpu module, resolved via manifest sources block). Phase D (fingerprint on every dispatched pointer event): pwi_dp_no_bar: call pwi_emit_fingerprint. Return xor rax, rax. Encoder discipline: no `test`, no imul (division via subtract-loop), no imm64 (only imm8 constants 8, 10, 80), no cmp reg,[mem] (all compares against imm or loaded regs). Labels pwi_dp_* prefixed pwi_dp_; no reserved-keyword substrings (uses _div_step_ / _div_end_ / _no_bar_).",
+      block: {
+        push rbx;
+
+        // Phase A: bounds -- y in [0, PWI_CPU_HEIGHT=80) is a CPU-bar
+        // click; outside that band, fall through to fingerprint emit.
+        cmp rdi, 80;
+        jae pwi_dp_no_bar;
+
+        // Phase B: cpu_idx = y / 10 via subtract-and-count.
+        xor rcx, rcx;                             // cpu_idx = 0
+        mov rax, rdi;                             // rax = y
+        pwi_dp_div_step:
+        cmp rax, 10;                              // PWI_CPU_BAR_PITCH
+        jb pwi_dp_div_end;
+        sub rax, 10;
+        add rcx, 1;
+        jmp pwi_dp_div_step;
+        pwi_dp_div_end:
+
+        // Sanity: cpu_idx < 8 (redundant with y<80, defensive).
+        cmp rcx, 8;                               // PWI_MAX_CPUS
+        jae pwi_dp_no_bar;
+
+        // Phase C: flip the detail flag for the clicked bar.
+        mov rdi, rcx;                             // cpu_idx
+        call cpu_widget_toggle_detail;
+
+        pwi_dp_no_bar:
+        // Phase D: fingerprint on every dispatched pointer event
+        // (one-shot via the shared _pwi_fp_emitted gate).
+        call pwi_emit_fingerprint;
+
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // input_dispatch_key(keycode) -> u64
+  //
+  // Handle a KEYDOWN event carrying `keycode`. If keycode == 'q'
+  // (0x71), request quit via Main::pw_request_quit which sets the
+  // Main-owned _pw_quit_requested flag. Any other keycode falls
+  // through to the fingerprint emit without touching the quit flag
+  // (matches the M4-003 pqs_state_key contract: "non-'q' keypress
+  // is COUNTED but MUST NOT raise the quit flag").
+  //
+  // Fires the fingerprint (one-shot) on every dispatched key event,
+  // including non-'q' keys -- the fingerprint tracks "input pipeline
+  // delivered an event", not "quit was raised".
+  //
+  // Contract:
+  //   rdi = keycode       ASCII byte in a u64; only the low byte is
+  //                       meaningful. The libpdx-event wire-in (when
+  //                       it lands) is responsible for delivering a
+  //                       canonicalized one-byte keycode; this
+  //                       landing does NOT strip high bits.
+  //   -> rax = 0          always
+  //
+  // Register plan: 1-push callee-save (rbx unused but pushed for
+  // alignment) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every
+  // nested call (pw_request_quit, pwi_emit_fingerprint).
+  // ==========================================================================
+  pub let input_dispatch_key : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (keycode: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): keydown dispatch. Contract SysV rdi=keycode. 1-push callee-save prologue (rbx unused but pushed for alignment) = 8B -> SysV rsp%16==8 + 8 = rsp%16==0 for every nested call. Phase A ('q' check): cmp rdi, 0x71 (PWI_KEY_Q); jne pwi_dk_not_q. If keycode == 'q', raise quit: call pw_request_quit (Main module, resolved via manifest sources block; sets _pw_quit_requested to 1). pwi_dk_not_q: unconditionally emit the fingerprint (one-shot via the shared _pwi_fp_emitted gate). Return xor rax, rax. Encoder discipline: no `test`, no imul, no imm64 (0x71 fits imm8), no cmp reg,[mem]. Labels: pwi_dk_not_q prefixed pwi_dk_; no reserved-keyword substrings. Matches the pqs_state_key contract at tests/test_q_quit_smoke.pdx#9: 'q' raises quit; any other keycode counts as an event but does NOT raise quit.",
+      block: {
+        push rbx;
+
+        // Phase A: 'q' check -- only ASCII 'q' raises the quit flag.
+        cmp rdi, 0x71;                            // PWI_KEY_Q
+        jne pwi_dk_not_q;
+        call pw_request_quit;
+
+        pwi_dk_not_q:
+        // Phase B: fingerprint on every dispatched key event.
+        call pwi_emit_fingerprint;
+
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // input_poll_events() -> u64
+  //
+  // Drain the libpdx-event input queue and dispatch every pending
+  // event through `input_dispatch_pointer` / `input_dispatch_key`.
+  // Returns the number of events dispatched (0 = queue empty).
+  //
+  // STUB(libpdx-event.M3-001): at this landing, libpdx-event's
+  // event_subscribe / event_next wrappers do NOT exist in the
+  // paideia-os monorepo, so this function short-circuits to a
+  // "no events pending" return. Main::main's dispatch loop calls
+  // this on every iteration; while the stub is in place, the quit-
+  // request flag stays 0 forever and the loop terminates via the
+  // bounded iterate budget (PW_MAIN_TICK_BUDGET = 32).
+  //
+  // Follow-up wire-in (title: "pdxwatch: retire input.pdx event-queue
+  // stub when libpdx-event.M3-001 lands") should be filed against
+  // paideia-os/pdxwatch when the library reaches M3; the wire-in
+  // replaces the stub body with:
+  //
+  //   event_next(&event) -> 0 (event) | -EAGAIN (empty) | -EIO
+  //   -> if type == POINTER_BUTTON_DOWN: input_dispatch_pointer(event.y)
+  //   -> if type == KEYDOWN:             input_dispatch_key(event.key)
+  //   loop until event_next returns -EAGAIN
+  //   return dispatched_count
+  //
+  // and the dispatch entries + fingerprint stay unchanged.
+  //
+  // Contract:
+  //   (nullary)
+  //   -> rax = 0          number of events dispatched (always 0 at
+  //                       stub; real value at wire-in time)
+  //
+  // Leaf; no callee-save touched, no nested call at stub.
+  // ==========================================================================
+  pub let input_poll_events : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M3-001 (pdxwatch#6): event-queue drain STUB. Body: xor rax, rax; ret. Zero pushes / pops -- leaf. Sysreg effect declared for the follow-up wire-in that will call sys_ipc_recv (sysno 40) via libpdx-event's event_next wrapper; at stub, no syscall is issued. The stub returns 0 (no events dispatched) unconditionally; Main::main's dispatch loop respects this by relying on the bounded iterate budget (PW_MAIN_TICK_BUDGET = 32) as the terminal exit path until the follow-up wire-in populates the queue drain and the quit-flag path lights up. STUB(libpdx-event.M3-001) marker at the callsite comment audit-trails the wire-up point. Encoder discipline: trivially compliant (zero mnemonics beyond xor + ret).",
+      block: {
+        // STUB(libpdx-event.M3-001): real event_next drain pending.
+        xor rax, rax;
+        ret
+      }
+    }
+
+}
