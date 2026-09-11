@@ -37,7 +37,7 @@
 # the same monorepo-satellite pattern.
 
 name        = pdxwatch
-version     = 1.1.0
+version     = 1.2.0
 kind        = tool
 # entry lands at M1-005 (_start binder + Main::main call). At M1-001
 # there is no _start; Main::main is the forward-declared entry that
@@ -179,18 +179,38 @@ compliance:
   - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
   - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
 
-# --- Release policy (M5-001) -------------------------------------------
-# Dual-signed release mirroring postui-top / shell shape. Lands at
-# M5-001 (pdxwatch v1.0.0 release closer). ML-DSA-65 is the primary
-# post-quantum signer; Ed25519 rides as a secondary classical signer
-# per the same dual-sign policy postui.M5-003 and shell.M5-001
-# established. `pkg install pdxwatch` requires BOTH signatures to
-# verify.
+# --- Release policy (M5-001, LANDED at v1.2.0) -------------------------
+# Dual-signed release mirroring postui-top / shell shape. Landed at
+# M5-001 (pdxwatch signed release closer, pdxwatch#10). ML-DSA-65 is
+# the primary post-quantum signer; Ed25519 rides as a secondary
+# classical signer per the same dual-sign policy postui.M5-003 and
+# shell.M5-001 established. `pkg install pdxwatch` requires BOTH
+# signatures to verify.
+#
+# Version-name note: the M5-001 issue names "1.0.0" as the signed-
+# release target (the milestone identity), but the pdxwatch semver
+# line advanced through v1.1-A/B/C (Track-C real-body + semantic-pipe
+# wave) and then through the M4 witness triplet before the M5-001
+# release closer landed. Semver monotonicity wins over the milestone
+# name: this landing tags v1.2.0. The fingerprint identity
+# `pdxwatch 1.0.0 signed ok` remains as the M5-001 witness string
+# (naming the milestone, not the version) per the R102.M5-001 issue
+# body. See release/RELEASE-1.2.0.md §1 for the full rationale.
 release:
   signer_author: snunez+pdxwatch-author@paideia-os.dev
   signer_root:   paideia-os-release-root@paideia-os.dev
   mldsa_level:   65
   ed25519:       required
   mirror_target: pkgs.paideia-os
-  tarball:       pdxwatch-v1.0.0.tar.gz
+  tarball:       pdxwatch-v1.2.0.tar.gz
   manifest_kind: satellite-tool
+  manifest_sig:  release/manifest.pdxsig.txt   # source form; binary
+                                               # `manifest.pdxsig` cut
+                                               # by paideia-release at
+                                               # tag time from tree
+                                               # BLAKE3-256s.
+  release_note:  release/RELEASE-1.2.0.md
+  verify_witness: tools/release-verify.sh      # emits fingerprint
+                                               # `pdxwatch 1.0.0
+                                               # signed ok` on
+                                               # dual-sig verify-pass.

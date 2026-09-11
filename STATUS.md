@@ -1,11 +1,17 @@
 # pdxwatch -- status
 
 **Wave:** R102 userland graphical stack -- reference apps
-**Current milestone:** v1.1-C release closer landed (pdxwatch#13) -- **v1.1.0 released**
-**Version:** 1.1.0 (Track-C release; M5-001 v1.0.0 signed-release
-closer remains a downstream milestone -- 1.1.0 reflects the
-Track-C real-body + semantic-pipe wave landing ahead of the
-graphical-stack completion)
+**Current milestone:** M5-001 signed-release closer landed
+(pdxwatch#10) -- **v1.2.0 cut (dual-sign pass pending live keys)**
+**Version:** 1.2.0 (M5-001 signed-release closer + M4 witness
+triplet. Version-name note: the M5-001 issue names "1.0.0" as the
+signed-release target, but the semver line advanced through
+v1.1-A/B/C (Track-C real-body + semantic-pipe wave) before this
+milestone landed. Semver monotonicity wins over the milestone name:
+this landing tags v1.2.0. The fingerprint identity
+`pdxwatch 1.0.0 signed ok` remains verbatim per the M5-001 witness
+contract -- see release/RELEASE-1.2.0.md §1 for the full
+reconciliation.)
 
 See [`paideia-os` monorepo `design/graphics/r102-user-plan.md`](https://github.com/paideia-os/paideia-os/blob/main/design/graphics/r102-user-plan.md)
 §2.8 (system-monitor GUI: role + data source + widget layout) and
@@ -22,10 +28,10 @@ issue breakdown.
 | M2-002 | Memory tri-color widget | pending libpdx-gfx M2 |
 | M2-003 | Network sparkline widget | pending libpdx-gfx M2 |
 | M3-001 | Click-cycle CPU detail + `q` quit | pending libpdx-event M3 |
-| M4-001 | Seeded-stat render smoke witness | pending M2 |
+| M4-001 | Seeded-stat render smoke witness | **landed 2026-09-10 (pdxwatch#7); expected-digest constants placeholder (see §Placeholder-fingerprint policy in tests/test_seeded_stat_smoke.pdx)** |
 | M4-002 | Click-cycle smoke | **encoder-half landed 2026-09-09 (pdxwatch#8); substrate pending M3-001** |
-| M4-003 | `q`-quit smoke | pending M3 |
-| M5-001 | Signed 1.0.0 release | pending M4 |
+| M4-003 | `q`-quit smoke | **encoder-half landed 2026-09-10 (pdxwatch#9); substrate pending M3-001** |
+| M5-001 | Signed 1.0.0 release (cut at v1.2.0 -- see version-name reconciliation above) | **landed 2026-09-11 (pdxwatch#10); dual-sign pass gates on live release-line keys per release/RELEASE-1.2.0.md §4 S3** |
 | v1.1-B | `SysStatRecord@0.1` semantic-pipe emission wire (pdxwatch#12) | **landed 2026-09-08** |
 | v1.1-C | Release closer v1.1.0 + tag (pdxwatch#13) | **landed 2026-09-08 (v1.1.0 tagged)** |
 
@@ -208,14 +214,80 @@ caps.decl churn.
 - `paideia-os/libpdx-font` v0.1 (M2) -- M2-001..M2-003 wire-in
   (gfx_draw_glyph label rendering).
 
-## Post-v1.1-C roadmap
+## M5-001 "signed release closer" landing details (pdxwatch#10)
 
-- M1-005: `_start` binder + Main::main call frame; produces a
-  linkable ELF at build-out/pdxwatch.
-- M2 wave: CPU / mem / net widgets against libpdx-gfx M2.
-- M3-001: libpdx-event M3 wire-in (click-cycle + 'q' quit).
-- M4 witness triplet: seeded-stat, click-cycle, keyboard-quit.
-- M5-001: signed 1.0.0 release closer.
+Closes the M5 milestone. Version bump + release policy wire-up +
+source-form dual-signed manifest + release-verify witness. No
+source .pdx churn (the M5-001 milestone is release-shape only; the
+M4 witness triplet already lands the pdxwatch-side coverage the
+signed release attests to).
+
+- `manifest.pdxproj` `version = 1.1.0` -> `version = 1.2.0`. The
+  `release:` block is extended with three new entries:
+  `manifest_sig` (points at `release/manifest.pdxsig.txt`),
+  `release_note` (points at `release/RELEASE-1.2.0.md`), and
+  `verify_witness` (points at `tools/release-verify.sh`, which
+  emits the `pdxwatch 1.0.0 signed ok` fingerprint on dual-sig
+  verify-pass). The `tarball` entry is bumped from
+  `pdxwatch-v1.0.0.tar.gz` to `pdxwatch-v1.2.0.tar.gz`; the rest
+  of the block (signer identities, ML-DSA level, mirror target) is
+  unchanged.
+- `release/RELEASE-1.2.0.md` (new): release note + operator
+  runbook mirroring `libpdx-volume`'s
+  `release/RELEASE-1.0.0.md` shape. §1 documents the version-name
+  reconciliation (M5-001 names 1.0.0; this cut is v1.2.0; the
+  fingerprint identity stays `pdxwatch 1.0.0 signed ok` per the
+  M5-001 witness contract).
+- `release/manifest.pdxsig.txt` (new): source form of the release
+  manifest; every `<BLAKE3-*>` slot a placeholder the release tool
+  recomputes at tag time from the working-tree hashes; every
+  signature slot a `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN` per
+  the release-line key-custody discipline (§4 S3 of the release
+  note).
+- `tools/release-verify.sh` (new): in-tree witness that
+  delegates to `paideia-release verify` and, on a successful
+  dual-sig AND-verify, echoes `pdxwatch 1.0.0 signed ok` to stdout.
+  Refuses fast (exit 3) when handed the source-form manifest to
+  prevent a false-green fingerprint over unsigned bytes. The QEMU
+  smoke driver grep-gates on the fingerprint alongside the peer
+  widget / input / M4-witness fingerprints.
+- `CHANGELOG.md`: new `## [1.2.0] - 2026-09-11` section migrates
+  the Unreleased entries (M4 witness triplet + M3-001 input
+  dispatch) below the release header and adds the M5-001 release
+  wire-up.
+- `STATUS.md` (this file): header `Version:` bumped, M4-001 /
+  M4-002 / M4-003 rows flipped to landed, M5-001 row flipped to
+  landed, this landing-details section added.
+- Tag command (run by main, not this landing):
+  `git tag -a v1.2.0 -m "pdxwatch v1.2.0 -- M5-001 signed release closer + M4 witness triplet"`.
+
+Follow-up hotfixes remaining open against v1.2.0:
+
+- pdxwatch#14 -- retire widget_cpu.pdx / widget_mem.pdx /
+  widget_net.pdx libpdx-gfx + libpdx-font inline stubs when
+  libpdx-gfx.M2-002 / libpdx-gfx.M2-003 / libpdx-font.M2-001
+  land. Target: v1.3.0.
+- pdxwatch#15 -- widget_net.pdx unsigned-wrap on `task_seen`
+  decrease -> false MAX spike. Target: v1.2.1 hotfix.
+
+## Post-v1.2.0 roadmap
+
+- **v1.2.1 (imminent)** -- pdxwatch#15 hotfix (widget_net
+  unsigned-wrap). Single-file `src/widget_net.pdx` change; no
+  manifest / caps.decl churn.
+- **v1.3.0** -- pdxwatch#14 stub retirement (three widget modules'
+  inline gfx/font stubs), gated on the libpdx-gfx M2 + libpdx-font
+  M2 landings.
+- **v1.4.0** -- libpdx-event.M3-001 wire-in retires the
+  `Input::input_poll_events` stub; unbounded main loop replaces
+  the `PW_MAIN_TICK_BUDGET = 32` bounded shape.
+- **v2.0.0** -- M1-005 `_start` binder + `Main::main` call-frame +
+  linkable ELF at `build-out/pdxwatch`; user-facing
+  `doc/pdxwatch.pdxdoc` first ships. This is the release the
+  M5-001 fingerprint identity (`pdxwatch 1.0.0 signed ok`) would
+  be renamed at, since v2.0.0 first crosses the "user launches
+  pdxwatch and sees a window" threshold the M5-001 name
+  originally anticipated.
 
 ## License
 

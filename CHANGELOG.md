@@ -7,7 +7,57 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ## [Unreleased]
 
+(Empty -- follow-up hotfixes tracked as pdxwatch#14 / #15 target the
+next patch releases; see STATUS.md `Post-v1.2.0 roadmap`.)
+
+## [1.2.0] - 2026-09-11
+
+M5-001 signed-release closer wave. Closes the M4 witness triplet
+(pdxwatch#7 / #8 / #9), the M3-001 input dispatch (pdxwatch#6),
+and the M5-001 signed-release wire-up (pdxwatch#10). Version-name
+note: the M5-001 issue names "1.0.0" as the signed-release target,
+but the semver line advanced through v1.1-A/B/C (Track-C real-body
++ semantic-pipe wave) before this milestone landed. Semver
+monotonicity wins over the milestone name: this landing tags
+v1.2.0. The fingerprint identity `pdxwatch 1.0.0 signed ok`
+remains verbatim per the M5-001 witness contract -- see
+`release/RELEASE-1.2.0.md` §1 for the reconciliation.
+
 ### Added
+
+- **v1.5-A -- M5-001 signed-release closer** (pdxwatch#10).
+  - `release/RELEASE-1.2.0.md` (new): release note + operator
+    runbook for cutting the dual-signed release (Ed25519 +
+    ML-DSA-65 AND-semantics per `design/02-development-
+    environment.md` §1140). Mirrors `libpdx-volume`'s
+    `release/RELEASE-1.0.0.md` shape (this org's other R53-era
+    satellite through M5). §1 documents the version-name
+    reconciliation.
+  - `release/manifest.pdxsig.txt` (new): source form of the
+    release manifest with every `<BLAKE3-*>` hash slot and every
+    signature slot a documented placeholder. The release tool
+    (`paideia-release fill-manifest` + `sign`) at operator tag
+    time recomputes hashes from the working tree and fills the
+    signature block from the paideia-release-line seed keys
+    (hardware-backed TPM 2.0 / cloud KMS custody per
+    `design/02-development-environment.md` §1164 -- no repo-
+    resident key material at any point).
+  - `tools/release-verify.sh` (new): in-tree witness that delegates
+    to `paideia-release verify` and, on a successful dual-sig
+    AND-verify, echoes the fingerprint identity `pdxwatch 1.0.0
+    signed ok` to stdout. Refuses fast (exit 3) when handed the
+    source-form manifest to prevent a false-green fingerprint over
+    unsigned bytes; refuses (exit 4) when `paideia-release` is
+    absent from PATH so S2-blocked configurations do not silently
+    emit success. The paideia-os QEMU smoke driver grep-gates on
+    the fingerprint alongside the peer widget / input / M4-witness
+    fingerprints.
+  - `manifest.pdxproj`: `version = 1.1.0` -> `version = 1.2.0`;
+    the `release:` block gains `manifest_sig` /
+    `release_note` / `verify_witness` entries pointing at the
+    three new release artefacts, and `tarball` bumps to
+    `pdxwatch-v1.2.0.tar.gz`.
+  - Closes #10.
 
 - **v1.4-A -- M4-001 seeded-stat render smoke** (pdxwatch#7).
   - `tests/test_seeded_stat_smoke.pdx` (new, `module TestSeededStatSmoke`):
@@ -71,6 +121,36 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
     M4-003 entries per the tests-band numeric ordering). The
     forward-declaration comment ("KIND_SYS_STAT seeding primitive")
     is rewritten to note the syscall-bypass resolution.
+  - Closes #7.
+
+- **v1.4-C -- M4-003 'q'-quit encoder-half smoke** (pdxwatch#9).
+  - `tests/test_q_quit_smoke.pdx` (new, `module TestQQuitSmoke`):
+    keypress state-machine + scripted 'q' witness. Adopts the
+    same "encoder-half ahead of substrate" shape M4-002 landed --
+    the state-transition contract (baseline-clean, 'q'-raises-quit
+    with `exit_status=0`, non-'q' keypress counts but does NOT
+    raise quit) is testable at every build; the M3-001 substrate
+    wire-in (`event_next -> pqs_state_key`) is deferred to
+    libpdx-event.M3-001. `pqs_run_all()` gates the paideia-os
+    QEMU smoke that emits the `pdxwatch quit ok` serial-console
+    fingerprint. Fail-code band `0xFFFFE2D0..0xFFFFE2DB` (adjacent
+    to M4-002's `0xFFFFE2C0..CB`) per the reservation in
+    `manifest.pdxproj` `tests:` block.
+  - Closes #9.
+
+- **v1.4-B -- M4-002 click-cycle encoder-half smoke** (pdxwatch#8).
+  - `tests/test_click_cycle_smoke.pdx` (new, `module
+    TestClickCycleSmoke`): CPU-bar detail-mode click-cycle
+    state-machine + scripted-click witness. Encoder-half ahead of
+    the M3-001 substrate (blocked on libpdx-event.M3). Three cases:
+    `pcc_case_baseline` (all-compact after init), `pcc_case_click_
+    bar0` (primary witness -- bar 0 flips compact -> expanded, one
+    sub-bar rendered), `pcc_case_toggle` (double-click round-trip;
+    guards against a stuck-on `mode |= 1` regression).
+    `pcc_run_all()` gates the paideia-os QEMU smoke that emits the
+    `pdxwatch click-cycle ok` serial-console fingerprint. Fail-code
+    band `0xFFFFE2C0..0xFFFFE2CB`.
+  - Closes #8.
 
 - **v1.3-A -- M3-001 click-cycle detail-toggle + 'q'-quit dispatch**
   (pdxwatch#6).
