@@ -1,0 +1,950 @@
+// src/widget_net.pdx -- pdxwatch.M2-003 (paideia-os/pdxwatch#5)
+//
+// WidgetNet module: per-interface bytes/s sparkline render widget.
+//
+// =============================================================================
+// SCOPE  (design/graphics/r102-user-plan.md §4.8 R102.M2-003)
+// =============================================================================
+//
+// Reads live per-interface bytes each second (via the CollectSnapshot the
+// Collectors module already populates) and renders a rolling sparkline
+// of the last PWN_RING_LEN=60 samples (~1 min of history at the 1 Hz
+// refresh cadence) into a caller-supplied BGRA8888 framebuffer. Line
+// segments are drawn via a `gfx_draw_line`-shaped wrapper; labels are
+// drawn via a `gfx_draw_glyph`-shaped wrapper. Emits the serial-console
+// fingerprint 'pdxwatch net-widget ok' once on the first successful
+// render (via SC+ sysno 12 sys_debug_puts).
+//
+// This module mirrors src/widget_cpu.pdx (pdxwatch#3, M2-001) and
+// src/widget_mem.pdx (pdxwatch#4, M2-002) shape exactly: same
+// fingerprint-emit path, same inline libpdx-gfx / libpdx-font stubs,
+// same BGRA store discipline (sized `mov_d`), same 5-push callee-save
+// + local-slot register plan. The one structural addition WidgetNet
+// contributes is the RING BUFFER holding the last PWN_RING_LEN samples
+// per interface, and the SPARKLINE render shape (line segments between
+// consecutive sample points, one per column of the sparkline area).
+//
+// =============================================================================
+// R102 WAVE-ORDERING NOTE
+// =============================================================================
+//
+// The R102 wave-ordering table names libpdx-gfx.M2-002 (gfx_fill_rect),
+// libpdx-gfx.M2-003 (gfx_draw_line) and libpdx-font.M2-001
+// (gfx_draw_glyph over the glyph store) as prerequisites; none of the
+// three have landed in the pdxwatch link path at this landing time.
+// Rather than block the widget on those upstream landings, this module
+// ships **minimal inline stubs**:
+//
+//   pwn_gfx_fill_rect (fb, x, y, w, h, color)      -- byte-for-byte
+//                                                     replica of
+//                                                     WidgetCpu /
+//                                                     WidgetMem stubs
+//   pwn_gfx_draw_glyph (fb, x, y, glyph, fg, bg)   -- byte-for-byte
+//                                                     replica of
+//                                                     WidgetCpu /
+//                                                     WidgetMem stubs
+//   pwn_gfx_draw_line  (fb, x0, y0, x1, y1, color) -- staircase
+//                                                     step-chart shape
+//                                                     (horizontal +
+//                                                     vertical fill_rect
+//                                                     pair); retires
+//                                                     when the real
+//                                                     Bresenham lands
+//                                                     libpdx-gfx.M2-003
+//
+// Every stub is prefixed `pwn_gfx_*` (not `gfx_*`) so a future round
+// that wires the real libpdx-gfx symbols does NOT collide on link, and
+// every stub-callsite carries a `// STUB(libpdx-gfx.M2-*)` marker so a
+// grep-driven audit can enumerate them at wire-up time. The follow-up
+// dependency issue (title: "pdxwatch: retire widget_cpu.pdx /
+// widget_mem.pdx / widget_net.pdx libpdx-gfx + libpdx-font stubs when
+// M2-002 / M2-003 / M2-001 land") covers all three widgets together.
+//
+// =============================================================================
+// NET-STAT SOURCE (M1-era proxy; sys_netinfo pending)
+// =============================================================================
+//
+// The R102.M2-003 issue text names the ideal shape: per-interface
+// bytes-transmitted / bytes-received counters, sampled once per second,
+// with delta = current - prior to derive per-second rate. Paideia-os
+// HEAD's SC+ layer does NOT surface a sys_netinfo / sys_ifinfo /
+// KIND_NET_STAT-invoke path -- searching design/user/syscall-table.md
+// for `net`, `ifinfo`, `netinfo`, `netdev` returns only the socket-
+// facing rows (86..102 for socket / bind / connect / poll and 103 for
+// icmp_echo) and none surface a per-interface byte counter.
+//
+// The widget therefore uses `task_seen` (CollectSnapshot[+176]) as an
+// M1-era ACTIVITY PROXY -- the delta between two consecutive
+// collect_tick refreshes approximates system-level throughput:
+//
+//     sample = task_seen - prior_task_seen        (unsigned wrap OK;
+//                                                  monotonically-
+//                                                  captured values
+//                                                  guarantee prior <=
+//                                                  current when the
+//                                                  ring is warm)
+//
+// The sample is intentionally left in "task-delta units" rather than
+// pre-scaled to KB/s so the sparkline dynamic range matches its
+// pixel-height budget (0..21 pixels; task_seen delta is 0..64 with a
+// 64-slot task pool, so a `min(sparkline_h - 1, sample)` clamp gives
+// exact per-pixel resolution without a runtime multiply). When
+// sys_netinfo / KIND_NET_STAT-invoke lands, this proxy retires in
+// favor of the ideal per-interface byte counter; the ring layout,
+// sparkline render shape, and label strip do not change.
+//
+// A widget-owned prior-sample scratch region (_pwn_prior_task_seen)
+// carries the previous-tick value across refreshes. On the very first
+// render call it reads as 0 (.bss initializer), so the first sample
+// is `task_seen - 0 = task_seen` -- a "burn-in" observation that
+// resolves within one refresh. Not worth guarding at M2-003.
+//
+// =============================================================================
+// RING BUFFER LAYOUT
+// =============================================================================
+//
+// Fixed-size circular sample store:
+//
+//   _pwn_ring    : [u8; MAX_NIFS * RING_LEN * 8]  = 1920 bytes
+//                  (4 interfaces * 60 samples * 8 bytes per u64 sample)
+//
+//   _pwn_ring_head : [u8; 8]  (u64 insert cursor, wraps modulo RING_LEN)
+//
+// Layout: ring[iface][slot] lives at offset (iface * 60 + slot) * 8.
+// At M2-003 only iface 0 is populated (single-interface proxy shape);
+// the other three slots (iface 1..3) stay zero-initialized and their
+// sparklines render flat. When multi-interface sys_netinfo lands the
+// per-iface aggregation step in mem_widget_render-shape's Phase C
+// widens without churning any offset constants.
+//
+// Insert semantics: `head` names the NEXT-INSERT slot. On refresh:
+//   ring[iface][head] = new_sample
+//   head = (head + 1) mod RING_LEN
+//
+// Read semantics (oldest-first, sparkline left-to-right): for i in
+// 0..RING_LEN, sample_i = ring[iface][(head + i) mod RING_LEN]. Because
+// head names the NEXT-INSERT slot, and the just-written slot was
+// head-1, iterating head..head+59 yields oldest..newest in temporal
+// order.
+//
+// The 1920-byte ring lives in .bss (zero-initialized at load); no
+// explicit init required. RING_LEN=60 is chosen so at 1Hz refresh
+// the visible history spans ~1 minute -- long enough to spot
+// per-minute bursts but short enough to fit in the 240-pixel-wide
+// sparkline area at 4px per sample.
+//
+// =============================================================================
+// FINGERPRINT (SC+ sysno 12 sys_debug_puts)
+// =============================================================================
+//
+// The R102.M2-003 issue names the observable serial-console fingerprint
+// 'pdxwatch net-widget ok'. Emitted through sys_debug_puts (sysno 12,
+// kernel-owned debug channel that bypasses normal fd routing -- see
+// design/user/syscall-table.md row 12) on the first successful render
+// call only; a one-shot flag `_pwn_fp_emitted` gates re-emission so
+// the 1Hz refresh loop does not spam the serial console.
+//
+// The 23-byte fingerprint string ("pdxwatch net-widget ok\n") is laid
+// down at runtime by three qword stores into `_pwn_fp_str` on first-
+// render entry -- identical shape to WidgetCpu's / WidgetMem's
+// fingerprint-emit path. The three qword constants below are LE-packed
+// ASCII (byte 0 = LSB):
+//
+//   [+0]  "pdxwatch"  = 0x6863_7461_7778_6470
+//                       (byte 0 = 'p' = 0x70 LSB) -- shared shape
+//                       with widget_cpu.pdx and widget_mem.pdx (all
+//                       three fingerprints start "pdxwatch ")
+//   [+8]  " net-wid"  = 0x6469_772d_7465_6e20
+//                       (byte 0 = ' ' = 0x20 LSB)
+//   [+16] "get ok\n\0" = 0x000a_6b6f_2074_6567
+//                       (byte 0 = 'g' = 0x67 LSB) -- shared shape
+//                       with widget_cpu.pdx / widget_mem.pdx (all
+//                       three fingerprints end "...-widget ok\n")
+//
+// =============================================================================
+// COLOR PALETTE (BGRA8888, stored via `mov_d [ptr], eax`)
+// =============================================================================
+//
+// The sparkline uses a single accent color distinct from the CPU
+// warning-gradient (green/yellow/red) and the memory blue-ramp, so a
+// user reading all three stacked widgets in the same rect immediately
+// parses the sparkline as a THIRD independent quantity. Cyan sits
+// visually between green and blue and works well over the dark
+// charcoal background both peer widgets use.
+//
+// BGRA8888 layout: byte 0 = B, byte 1 = G, byte 2 = R, byte 3 = A.
+//
+//   PWN_COLOR_BG    = 0xFF202020  dark charcoal (widget-rect background;
+//                                                matches peer widgets)
+//   PWN_COLOR_TRACK = 0xFF404040  medium charcoal (sparkline baseline)
+//   PWN_COLOR_SPARK = 0xFF00C0C0  cyan (sparkline line segments)
+//   PWN_COLOR_LABEL = 0xFFE0E0E0  near-white (label glyph fg; matches
+//                                             peer widgets)
+//
+// =============================================================================
+// FRAMEBUFFER STRIDE
+// =============================================================================
+//
+// The M1-002 surface_open landing has not yet minted a real
+// KIND_SURFACE; the caller (Main::main) supplies a stub .bss
+// framebuffer whose stride is fixed at PWN_FB_STRIDE_BYTES=1024
+// (256 pixels * 4 bytes/BGRA). Matches WidgetCpu's and WidgetMem's
+// constant so a single _pw_fb allocation feeds all three widgets.
+// Retired together with peer widgets' PWC/PWM stride constants when
+// gfx_surface_open lands and SurfaceHandle carries stride.
+//
+// =============================================================================
+// FRAMEBUFFER GROWTH (v1.2-C addition)
+// =============================================================================
+//
+// The v1.2-A / v1.2-B _pw_fb allocation was 256x96 = 98304 bytes: CPU
+// widget filled rows 0..79 (h=80) and mem widget filled rows 84..93
+// (y0=84, h=10). WidgetNet needs 32 more rows (8 label + 2 gap + 20
+// sparkline + 2 margin) at y0=96, so _pw_fb grows to 256x128 = 131072
+// bytes (v1.2-C bump). The peer widgets' geometry is UNCHANGED --
+// only _pw_fb's tail extends. Rows 94..95 remain visual gap between
+// the mem bar and the net widget. See main.pdx §_pw_fb comment for
+// the updated layout table.
+//
+// =============================================================================
+// MODULE NAME DEVIATION
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag requires module
+// name = file basename PascalCased. File `widget_net.pdx` -> module
+// `WidgetNet`. Cross-module callers (Main::main) invoke this surface
+// through `net_widget_render` below.
+//
+// =============================================================================
+// EXTENDED-ARITY NOTE (mirrors WidgetCpu / WidgetMem)
+// =============================================================================
+//
+// The R102.M2-003 issue text names a 5-arg signature (fb, x0, y0, w, h).
+// The extension to 6 args (adding snap_ptr) is deliberate and mirrors
+// peer widgets -- pdxwatch's M1-era has no shared-global snapshot slot
+// so the caller (Main::main) has to pass its `_pw_snapshot` address
+// explicitly. When M1-002 introduces a widget-registry global that
+// holds the active snapshot pointer, all three widgets' signatures
+// narrow back to the 5-arg shape together.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`WidgetNet`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0` / `cmp reg, N`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). BGRA
+//     color constants (0xFFxxxxxx band) are used only in `mov reg, imm`.
+//   - No `imul` mnemonic at all (neither 2-op nor 3-op). All fixed-
+//     constant multiplications use shl / shl+add. Runtime-value
+//     multiplications by 8 (glyph advance, ring slot stride) and by
+//     4 (sample x-pitch) use shl reg, N with N in imm8 range.
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first); no `sub reg,
+//     [mem]` (every subtract loads through a scratch first);
+//     no `neg` mnemonic (negation computed as `xor reg, reg; sub
+//     reg, other` or absorbed into a rearranged compare).
+//   - Every 32-bit BGRA pixel store lives inside pwn_gfx_fill_rect
+//     and uses the sized `mov_d [mem], rax` mnemonic (G1 discipline).
+//   - r11 is scratch (paideia-as reserved -- never touched in this module).
+//   - SysV alignment: every nested-call function pushes an odd count
+//     of 8-byte callee-save registers (or an even count + one pad
+//     push) so `rsp % 16 == 0` at every call boundary.
+//   - `pub let` single-line declarations only (multi-line `pub let
+//     ="..."` is a paideia-as pitfall).
+//   - Labels prefixed `pwn_*`; substring "loop" avoided defensively
+//     (labels use `_iter_` / `_scan_` / `_step_` / `_spark_`);
+//     reserved keywords (`loop`, `if`, `then`, `else`, `test`) NEVER
+//     appear as labels.
+
+module WidgetNet = structure {
+
+  // ==========================================================================
+  // Dimensions + limits
+  // ==========================================================================
+
+  // Number of network interfaces tracked in the ring buffer. Sized at 4
+  // to reserve headroom for a real multi-interface sys_netinfo landing
+  // without a ring resize; at M2-003 only iface 0 is populated.
+  pub let PWN_MAX_NIFS               : u64 = 4
+
+  // Sample-ring depth. At 1 Hz refresh, 60 samples ~= 1 min of history.
+  pub let PWN_RING_LEN               : u64 = 60
+
+  // Ring-slot pitch (bytes per sample entry).
+  pub let PWN_RING_SLOT_BYTES        : u64 = 8
+
+  // Per-interface ring stride (bytes): PWN_RING_LEN * PWN_RING_SLOT_BYTES.
+  // 60 * 8 = 480. Not a power of two, but iface 0 is the only populated
+  // slot at M2-003 so the per-iface offset is 0 and no runtime multiply
+  // is needed.
+  pub let PWN_RING_IFACE_STRIDE      : u64 = 480
+
+  // Widget-rect geometry (matches main.pdx wire-in: y0=96, h=32).
+  pub let PWN_WIDGET_HEIGHT          : u64 = 32
+  pub let PWN_LABEL_HEIGHT_PX        : u64 = 8
+  pub let PWN_LABEL_GAP_PX           : u64 = 2         // between label and spark
+  pub let PWN_SPARK_HEIGHT_PX        : u64 = 22        // 32 - 8 - 2 (bottom mrg 0)
+  pub let PWN_SPARK_TOP_OFFSET_PX    : u64 = 10        // label(8) + gap(2)
+
+  // Sample x-pitch (pixels per sample point). 4 * 60 = 240px sparkline
+  // width, fits within the default 256-wide widget rect with 16px right
+  // margin for future annotations.
+  pub let PWN_SAMPLE_X_PITCH_PX      : u64 = 4
+
+  // Label strip: 9 glyph cells at 8-px advance, mirrors peer widgets.
+  pub let PWN_GLYPH_ADVANCE_PX       : u64 = 8
+  pub let PWN_GLYPH_HEIGHT_PX        : u64 = 8
+  pub let PWN_LABEL_GLYPH_COUNT      : u64 = 9         // "eth0 K/s "
+  pub let PWN_LABEL_WIDTH_PX         : u64 = 72        // 9 * 8
+
+  // Framebuffer stride (bytes per row). Fixed at 1024 for the M1-era
+  // stub fb Main::main allocates as .bss (256px * 4 BGRA). Matches
+  // peer widgets. Retired when gfx_surface_open lands and
+  // SurfaceHandle carries stride.
+  pub let PWN_FB_STRIDE_BYTES        : u64 = 1024
+
+  // ==========================================================================
+  // BGRA8888 colors (see §COLOR PALETTE).
+  // ==========================================================================
+  pub let PWN_COLOR_BG               : u64 = 0xFF202020
+  pub let PWN_COLOR_TRACK            : u64 = 0xFF404040
+  pub let PWN_COLOR_SPARK            : u64 = 0xFF00C0C0
+  pub let PWN_COLOR_LABEL            : u64 = 0xFFE0E0E0
+
+  // ==========================================================================
+  // Snapshot field offsets (mirror src/collectors.pdx). Named locally so
+  // widget code reads without cross-module import churn.
+  // ==========================================================================
+  pub let PWN_SNAP_OFF_REFRESH_COUNT   : u64 = 16
+  pub let PWN_SNAP_OFF_TASK_SEEN       : u64 = 176
+
+  // ==========================================================================
+  // Error sentinels. Collectors owns 0xFFFFE200..0xFFFFE20F; WidgetCpu
+  // claims 0xFFFFE210..0xFFFFE21F; WidgetMem claims 0xFFFFE220..0xFFFFE22F.
+  // WidgetNet claims the next 16-slot sub-band 0xFFFFE230..0xFFFFE23F.
+  // ==========================================================================
+  pub let PWN_OK                     : u64 = 0
+  pub let PWN_ERR_BAD_FB_PTR         : u64 = 0xFFFFE230
+  pub let PWN_ERR_BAD_SNAP_PTR       : u64 = 0xFFFFE231
+  pub let PWN_ERR_RECT_TOO_SMALL     : u64 = 0xFFFFE232
+
+  // ==========================================================================
+  // SC+ syscall constants
+  // ==========================================================================
+  pub let PWN_SYS_DEBUG_PUTS         : u64 = 12
+  pub let PWN_FINGERPRINT_LEN        : u64 = 23        // "pdxwatch net-widget ok\n"
+
+  // ==========================================================================
+  // Widget-owned .bss scratch:
+  //   _pwn_fp_emitted        [u8; 8]     one-shot flag: 0=pending, 1=done
+  //   _pwn_fp_str            [u8; 32]    fingerprint string composed
+  //                                      byte-wise on first render
+  //   _pwn_ring              [u8; 1920]  MAX_NIFS(4) * RING_LEN(60) *
+  //                                      SLOT_BYTES(8) circular sample
+  //                                      buffer; layout ring[iface][slot]
+  //                                      at byte offset (iface*60+slot)*8
+  //   _pwn_ring_head         [u8; 8]     u64 insert cursor, wraps at
+  //                                      RING_LEN; names the NEXT-INSERT
+  //                                      slot (so head-1 was newest,
+  //                                      head is oldest going forward)
+  //   _pwn_prior_task_seen   [u8; 8]     previous-tick task_seen value;
+  //                                      sample_this_tick = task_seen -
+  //                                      prior_task_seen (unsigned wrap OK)
+  // Everything zeroed by .bss loader; no explicit init required.
+  // ==========================================================================
+  pub let mut _pwn_fp_emitted        : [u8; 8]    = uninit @align(8)
+  pub let mut _pwn_fp_str            : [u8; 32]   = uninit @align(8)
+  pub let mut _pwn_ring              : [u8; 1920] = uninit @align(8)
+  pub let mut _pwn_ring_head         : [u8; 8]    = uninit @align(8)
+  pub let mut _pwn_prior_task_seen   : [u8; 8]    = uninit @align(8)
+
+  // ==========================================================================
+  // pwn_sys_debug_puts(buf_ptr, count) -> u64
+  //
+  // Thin wrapper around SC+ sysno 12 (sys_debug_puts). Byte-for-byte
+  // replica of WidgetCpu's / WidgetMem's peer wrapper. Leaf.
+  // ==========================================================================
+  pub let pwn_sys_debug_puts : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (buf_ptr: u64) (count: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M2-003 (pdxwatch#5): SC+ sysno 12 (sys_debug_puts) wrapper. SysV rdi=buf_ptr / rsi=count pass through unchanged to SYSCALL rdi/rsi. mov rax, 12; syscall; ret. Kernel-owned debug channel (bypasses fd routing) -- design/user/syscall-table.md row 12. Sole consumer: pwn_emit_fingerprint below, which fires exactly once on the first successful net_widget_render call. Leaf: rcx/r11 SYSCALL-clobbered (both SysV caller-save). Byte-for-byte replica of WidgetCpu::pwc_sys_debug_puts / WidgetMem::pwm_sys_debug_puts -- when the shared gfx_stubs module lands all three wrappers collapse into one.",
+      block: {
+        mov rax, 12;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwn_gfx_fill_rect(fb_ptr, x, y, w, h, color) -> u64
+  //
+  // STUB(libpdx-gfx.M2-002): inline BGRA8888 rect-fill primitive.
+  // Byte-for-byte replica of WidgetCpu's / WidgetMem's peer stub.
+  // Contract identical to pwc_gfx_fill_rect / pwm_gfx_fill_rect.
+  // Zero-w or zero-h short-circuits via the cmp/jae guards in the
+  // scan loops so callers may pass w=0 to skip.
+  // ==========================================================================
+  pub let pwn_gfx_fill_rect : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fb_ptr: u64) (x: u64) (y: u64) (w: u64) (h: u64) (color: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M2-003 (pdxwatch#5): inline BGRA fill-rect stub for libpdx-gfx.M2-002 pre-landing. Byte-for-byte replica of WidgetCpu::pwc_gfx_fill_rect / WidgetMem::pwm_gfx_fill_rect. Two nested loops (row 0..h, col 0..w). Row base = fb + (y+row)*STRIDE + x*4. STRIDE=1024 hard-coded (retired when SurfaceHandle carries stride). Pixel store: `mov_d [ptr], rax` sized 32-bit BGRA write (G1 discipline: bare `mov [mem], eax` widens to REX.W and clobbers 8 bytes; use the sized mnemonic). Register plan: push rbx/r12/r13/r14/r15 (5 pushes = 40B, %16==0 after entry+40), sub rsp, 16 (color local slot; %16 preserved). rbx=fb, r12=x, r13=y, r14=w, r15=h, [rsp+0]=color. r10 outer row cursor (0..h), rcx inner col cursor (0..w), r9 row_base pointer, rax pixel payload -- all caller-save, no nested calls means r10/rcx safe as scratch. y_offset = row_y * 1024 computed as `shl r9, 10` (no imul; STRIDE is a power-of-two). x_offset = x*4 via `shl rcx, 2`. Zero-w or zero-h short-circuits via `cmp/jae` before the store, so the caller can pass w=0 to skip a segment. Return xor rax, rax at exit (0=OK). Encoder discipline: no `test`, no imul, every immediate in cmp fits imm8 (0, 1, 2, 4, 8, 10, 16). Labels pwn_fr_row_step / pwn_fr_row_end / pwn_fr_col_step / pwn_fr_col_end prefixed pwn_, no reserved keywords.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                             // rbx = fb_ptr
+        mov r12, rsi;                             // r12 = x
+        mov r13, rdx;                             // r13 = y
+        mov r14, rcx;                             // r14 = w
+        mov r15, r8;                              // r15 = h
+        mov [rsp + 0], r9;                        // color local
+
+        xor r10, r10;                             // row = 0
+        pwn_fr_row_step:
+        cmp r10, r15;
+        jae pwn_fr_row_end;
+
+        // row_base = fb + (y+row)*1024 + x*4
+        mov r9, r13;
+        add r9, r10;                              // r9 = row_y
+        shl r9, 10;                               // r9 = row_y * 1024
+        add r9, rbx;                              // r9 = fb + row_y*1024
+        mov rcx, r12;                             // rcx = x
+        shl rcx, 2;                               // rcx = x*4
+        add r9, rcx;                              // r9 = row_base
+
+        xor rcx, rcx;                             // col = 0
+        pwn_fr_col_step:
+        cmp rcx, r14;
+        jae pwn_fr_col_end;
+        mov rax, [rsp + 0];                       // color
+        mov_d [r9 + 0], rax;                      // sized 32-bit BGRA write
+        add r9, 4;
+        add rcx, 1;
+        jmp pwn_fr_col_step;
+        pwn_fr_col_end:
+
+        add r10, 1;
+        jmp pwn_fr_row_step;
+        pwn_fr_row_end:
+
+        xor rax, rax;
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwn_gfx_draw_glyph(fb_ptr, x, y, glyph, fg, bg) -> u64
+  //
+  // STUB(libpdx-font.M2-001 + libpdx-gfx.M2-004): 8x8 glyph-cell fill
+  // with `fg`. Byte-for-byte replica of WidgetCpu's / WidgetMem's peer
+  // stub. Retires when libpdx-font glyph store + gfx_draw_glyph land.
+  // ==========================================================================
+  pub let pwn_gfx_draw_glyph : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fb_ptr: u64) (x: u64) (y: u64) (glyph: u64) (fg: u64) (bg: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M2-003 (pdxwatch#5): libpdx-font.M2-001 + libpdx-gfx.M2-004 pre-landing stub. Byte-for-byte replica of WidgetCpu::pwc_gfx_draw_glyph / WidgetMem::pwm_gfx_draw_glyph. Draws a fg-colored 8x8 cell at (x, y). Delegates to pwn_gfx_fill_rect with w=8/h=8/color=fg. SysV rdi/rsi/rdx pass through unchanged; rcx (glyph) is ignored; r8 (fg) is remapped to color arg (r9 slot for fill_rect); r9 (bg) is ignored. Register plan: 4-push callee-save (rbx=fb, r12=fg, r13=x, r14=y) + 1-push pad (rax discarded) = 40B pushes. Entry rsp %16==8; +40 = 48 %16==0 -> aligned for the pwn_gfx_fill_rect call. Encoder discipline: no test, no imul, immediates fit imm8. Labels: none needed (linear body).",
+      block: {
+        push rbx;                                 // preserve for outer callers
+        push r12;                                 // r12 = fg
+        push r13;                                 // r13 = x
+        push r14;                                 // r14 = y
+        push rax;                                 // pad -> rsp %16 == 0
+
+        mov rbx, rdi;                             // fb
+        mov r13, rsi;                             // x
+        mov r14, rdx;                             // y
+        mov r12, r8;                              // fg (color)
+
+        // Delegate to pwn_gfx_fill_rect(fb, x, y, 8, 8, fg)
+        mov rdi, rbx;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, 8;                               // PWN_GLYPH_ADVANCE_PX
+        mov r8, 8;                                // PWN_GLYPH_HEIGHT_PX
+        mov r9, r12;                              // color = fg
+        call pwn_gfx_fill_rect;
+
+        xor rax, rax;
+        pop rcx;                                  // discard pad
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwn_gfx_draw_line(fb_ptr, x0, y0, x1, y1, color) -> u64
+  //
+  // STUB(libpdx-gfx.M2-003): connect-the-dots line-segment stub for
+  // libpdx-gfx.M2-003 (`gfx_draw_line`) pre-landing. When the real
+  // Bresenham entry lands in libpdx-gfx.M2-003 this stub retires and
+  // the sparkline callsites below rewire to the library entry through
+  // the SurfaceHandle-carrying signature.
+  //
+  // M2-003 stub shape: STAIRCASE step-chart -- draws one horizontal
+  // fill_rect from (x0, y0) to (x1, y0), then one vertical fill_rect
+  // from (x1, min(y0,y1)) to (x1, max(y0,y1)). This gives a valid
+  // connect-the-dots visualization (both endpoints painted, both
+  // reachable by a continuous 1-px trace) with a right-angle corner
+  // at (x1, y0) instead of the diagonal a true Bresenham would draw.
+  // For the small dx=4 / small-|dy| segments the sparkline actually
+  // uses, the staircase is visually indistinguishable from a real
+  // line at the pixel scale a 22-row sparkline area supports; the
+  // upgrade to true Bresenham lands with libpdx-gfx.M2-003.
+  //
+  // Contract:
+  //   rdi = fb_ptr, rsi = x0, rdx = y0, rcx = x1, r8 = y1, r9 = color
+  //   -> rax = 0 always
+  //
+  // Preconditions: x1 >= x0 (sparkline draws strictly left-to-right;
+  // the staircase's horizontal segment computes width = x1 - x0 + 1
+  // assuming x1 >= x0). y0 and y1 may be in either order. No bounds
+  // check against fb extents -- pwn_gfx_fill_rect is stride-only, so
+  // out-of-rect coords write into adjacent .bss (defensive check
+  // would land at libpdx-gfx.M2-003 wire-up).
+  //
+  // Register plan: 5-push callee-save prologue (rbx=fb, r12=color,
+  // r13=x1, r14=y1, r15=unused-pad) + sub rsp, 16 (x0/y0 stack slots)
+  // = 40B pushes + 16B locals. Entry rsp %16==8; +40=48 %16==0; +16
+  // keeps aligned for the pwn_gfx_fill_rect calls.
+  // ==========================================================================
+  pub let pwn_gfx_draw_line : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fb_ptr: u64) (x0: u64) (y0: u64) (x1: u64) (y1: u64) (color: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M2-003 (pdxwatch#5): staircase step-chart stub for libpdx-gfx.M2-003 (gfx_draw_line) pre-landing. Two fill_rect calls per segment: (1) horizontal 1-px band from (x0, y0) to (x1, y0) with width = x1-x0+1; (2) vertical 1-px column at x1 spanning [min(y0,y1) .. max(y0,y1)] with height = |y1-y0|+1. The corner at (x1, y0) is painted by both fills; the redundant pixel is a no-op cost. Order-of-y branches at pwn_ln_y_eq / pwn_ln_y1_gt / pwn_ln_y1_lt handle the three cases (y0==y1 skips the vertical entirely; y1>y0 places the vertical at (x1, y0); y1<y0 places it at (x1, y1)). Register plan: 5-push callee-save (rbx=fb, r12=color, r13=x1, r14=y1, r15=pad/unused) + sub rsp, 16 (x0/y0 slots) = 40B + 16B. Entry rsp %16==8; +40=48 %16==0; +16 keeps aligned for the nested pwn_gfx_fill_rect calls. [rsp+0]=x0, [rsp+8]=y0. Encoder discipline: no test (every zero-check via cmp reg, 0); no imul (no multiplication anywhere -- all arithmetic is add/sub/cmp); no `and reg, imm64`; no `cmp reg, [mem]` (every compare loads through rax or a scratch first); no `sub reg, [mem]`; no neg (|y1-y0| is computed inside the branch that already knows the ordering). Immediates in cmp fit imm8. Labels pwn_ln_* prefixed, no reserved keywords.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                             // fb
+        mov [rsp + 0], rsi;                       // x0
+        mov [rsp + 8], rdx;                       // y0
+        mov r13, rcx;                             // x1
+        mov r14, r8;                              // y1
+        mov r12, r9;                              // color
+
+        // ---- Horizontal segment: fill_rect(fb, x0, y0, x1-x0+1, 1, color)
+        // Width = x1 - x0 + 1. Precondition x1 >= x0.
+        mov rdi, rbx;
+        mov rsi, [rsp + 0];                       // x0
+        mov rdx, [rsp + 8];                       // y0
+        mov rcx, r13;                             // x1
+        mov rax, [rsp + 0];                       // rax = x0 (scratch load
+                                                  //  to avoid sub reg, [mem])
+        sub rcx, rax;                             // rcx = x1 - x0
+        add rcx, 1;                               // width = x1 - x0 + 1
+        mov r8, 1;                                // height = 1
+        mov r9, r12;                              // color
+        call pwn_gfx_fill_rect;
+
+        // ---- Vertical segment ------------------------------------------------
+        // Compare y0 and y1, then place the vertical column at (x1, y_min)
+        // with height |y1 - y0| + 1. y0==y1 skips (horizontal already
+        // covered the single-pixel endpoint).
+        mov rax, r14;                             // y1
+        mov rcx, [rsp + 8];                       // y0 (scratch load)
+        cmp rax, rcx;
+        je pwn_ln_vert_done;
+        ja pwn_ln_y1_gt;
+
+        // ---- y1 < y0: vertical at (x1, y1), height = y0 - y1 + 1
+        mov rdi, rbx;
+        mov rsi, r13;                             // x1
+        mov rdx, r14;                             // y = y1 (smaller)
+        // height = y0 - y1  (rcx=y0, rax=y1)
+        sub rcx, rax;
+        add rcx, 1;                               // height = y0 - y1 + 1
+        mov r8, rcx;                              // r8 = height
+        mov rcx, 1;                               // width = 1
+        mov r9, r12;                              // color
+        call pwn_gfx_fill_rect;
+        jmp pwn_ln_vert_done;
+
+        pwn_ln_y1_gt:
+        // ---- y1 > y0: vertical at (x1, y0), height = y1 - y0 + 1
+        mov rdi, rbx;
+        mov rsi, r13;                             // x1
+        mov rdx, rcx;                             // y = y0 (smaller;
+                                                  //  rcx still holds y0)
+        // height = y1 - y0  (rax=y1, rcx=y0)
+        sub rax, rcx;
+        add rax, 1;                               // height = y1 - y0 + 1
+        mov r8, rax;                              // r8 = height
+        mov rcx, 1;                               // width = 1
+        mov r9, r12;                              // color
+        call pwn_gfx_fill_rect;
+
+        pwn_ln_vert_done:
+
+        xor rax, rax;
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwn_emit_fingerprint() -> u64
+  //
+  // One-shot fingerprint emission. Composes "pdxwatch net-widget ok\n"
+  // (23 bytes) into _pwn_fp_str via three qword stores, then calls
+  // pwn_sys_debug_puts. Guarded by _pwn_fp_emitted (0 -> emit + set,
+  // 1 -> skip). Returns 1 on emit, 0 on skip. Byte-for-byte replica
+  // of WidgetCpu::pwc_emit_fingerprint / WidgetMem::pwm_emit_fingerprint
+  // modulo the middle qword (" net-wid" instead of " cpu-wid" /
+  // " mem-wid"). The first and third qwords are identical to the peer
+  // widgets' fingerprints since all three end "..widget ok\n".
+  // ==========================================================================
+  pub let pwn_emit_fingerprint : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M2-003 (pdxwatch#5): one-shot 'pdxwatch net-widget ok\\n' emit via SC+ sysno 12 sys_debug_puts. Guard: mov rax, [rip + _pwn_fp_emitted]; cmp rax, 0; jne skip (already emitted). Compose: three qword stores into _pwn_fp_str encoding the 23-byte string in ASCII LE (first and third qwords identical to WidgetCpu/WidgetMem since all three end '...-widget ok\\n'; middle qword ' net-wid' encodes as 0x6469772d7465_6e20 -- byte 0='sp'=0x20 LSB, byte 7='d'=0x64 MSB). Emit: lea rdi, [rip + _pwn_fp_str]; mov rsi, 23; call pwn_sys_debug_puts. Mark: mov rax, 1; mov [rip + _pwn_fp_emitted], rax. Return 1 (emitted) or 0 (skipped). Register plan: 3 pushes (rbx, r12 reserved, rax pad) = 24B; entry rsp %16==8, +24 = 32 %16==0 -> aligned for the syscall wrapper call. Encoder discipline: no test (cmp rax, 0 for the guard); no imul; every color/string qword constant used only in mov (movabs form legal). Labels pwn_fp_emit / pwn_fp_skip / pwn_fp_done prefixed pwn_.",
+      block: {
+        push rbx;
+        push r12;                                 // reserved (unused, alignment)
+        push rax;                                 // pad -> %16=0 (3 pushes = 24B)
+
+        // Guard: skip if already emitted.
+        mov rax, [rip + _pwn_fp_emitted];
+        cmp rax, 0;
+        jne pwn_fp_skip;
+
+        // Compose 23-byte string into _pwn_fp_str.
+        // "pdxwatch": bytes p(70) d(64) x(78) w(77) a(61) t(74) c(63) h(68)
+        //             LE qword = 0x68_63_74_61_77_78_64_70
+        mov rax, 0x6863746177786470;              // "pdxwatch" (LE)
+        mov [rip + _pwn_fp_str + 0], rax;
+        // " net-wid": bytes SP(20) n(6e) e(65) t(74) -(2d) w(77) i(69) d(64)
+        //             LE qword = 0x64_69_77_2d_74_65_6e_20
+        mov rax, 0x6469772d74656e20;              // " net-wid" (LE)
+        mov [rip + _pwn_fp_str + 8], rax;
+        // "get ok\n\0": bytes g(67) e(65) t(74) SP(20) o(6f) k(6b) LF(0a) NUL(00)
+        //                LE qword = 0x00_0a_6b_6f_20_74_65_67
+        mov rax, 0x000a6b6f20746567;              // "get ok\n\0" (LE)
+        mov [rip + _pwn_fp_str + 16], rax;
+
+        // Emit via sys_debug_puts.
+        lea rdi, [rip + _pwn_fp_str];
+        mov rsi, 23;                              // PWN_FINGERPRINT_LEN
+        call pwn_sys_debug_puts;
+
+        // Mark emitted.
+        mov rax, 1;
+        mov [rip + _pwn_fp_emitted], rax;
+
+        // Return 1 (emitted).
+        mov rax, 1;
+        jmp pwn_fp_done;
+
+        pwn_fp_skip:
+        xor rax, rax;
+
+        pwn_fp_done:
+        pop rcx;                                  // discard pad (was rax)
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // net_widget_render(fb_ptr, snap_ptr, x0, y0, width, height) -> u64
+  //
+  // Renders the per-interface bytes/s sparkline widget into the
+  // (x0, y0, width, height) rect of the caller-supplied BGRA8888
+  // framebuffer. Reads task_seen from `snap_ptr` (as an M1-era
+  // activity proxy for per-interface bytes/s -- see §NET-STAT SOURCE),
+  // computes the delta against the widget-owned prior-sample scratch,
+  // inserts the new sample into the ring, then re-renders the entire
+  // sparkline (label strip + baseline + 59 connected line segments
+  // across the 60-sample ring).
+  //
+  // Contract:
+  //   rdi = fb_ptr     VA of a BGRA8888 back-buffer, stride
+  //                    PWN_FB_STRIDE_BYTES bytes/row.
+  //   rsi = snap_ptr   VA of a CollectSnapshot (>= 256 bytes,
+  //                    populated by Collectors::collect_init +
+  //                    collect_tick).
+  //   rdx = x0         left edge of the widget rect (pixels)
+  //   rcx = y0         top edge of the widget rect (pixels)
+  //   r8  = width      widget rect width (pixels; must be >= 240
+  //                    -- 60 samples * 4-px pitch)
+  //   r9  = height     widget rect height (pixels; must be >= 32)
+  //
+  // Returns:
+  //   rax = 0                        rendered OK
+  //   rax = PWN_ERR_BAD_FB_PTR       fb_ptr was 0
+  //   rax = PWN_ERR_BAD_SNAP_PTR     snap_ptr was 0
+  //   rax = PWN_ERR_RECT_TOO_SMALL   width < 240 or height < 32
+  //
+  // Register plan: 5-push callee-save (rbx=fb, r12=snap, r13=x0,
+  // r14=y0, r15=width) + sub rsp, 64 (8 stack locals). Entry rsp
+  // %16==8, +40 = 48 %16==0, +64 keeps aligned.
+  //
+  // Stack locals ([rsp + K]):
+  //   [rsp +  0] = height       (u64)
+  //   [rsp +  8] = sample       (u64; this tick's task_seen delta)
+  //   [rsp + 16] = prev_x       (u64; sparkline previous sample x)
+  //   [rsp + 24] = prev_y       (u64; sparkline previous sample y)
+  //   [rsp + 32] = cur_x        (u64; sparkline current sample x)
+  //   [rsp + 40] = cur_y        (u64; sparkline current sample y)
+  //   [rsp + 48] = iter_i       (u64; sparkline sample cursor 0..RING_LEN)
+  //   [rsp + 56] = reserved / scratch
+  // ==========================================================================
+  pub let net_widget_render : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (fb_ptr: u64) (snap_ptr: u64) (x0: u64) (y0: u64) (width: u64) (height: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M2-003 (pdxwatch#5): per-interface bytes/s sparkline widget render entry. Register plan: 5-push callee-save (rbx=fb, r12=snap, r13=x0, r14=y0, r15=width) + sub rsp, 64 for 8 stack locals. Entry rsp%16==8; +40 pushes = %16==0; +64 locals keeps %16==0 for every nested call (pwn_gfx_fill_rect, pwn_gfx_draw_glyph, pwn_gfx_draw_line, pwn_emit_fingerprint). Locals: [rsp+0]=height, [rsp+8]=sample, [rsp+16]=prev_x, [rsp+24]=prev_y, [rsp+32]=cur_x, [rsp+40]=cur_y, [rsp+48]=iter_i, [rsp+56]=reserved. Phase A (arg validation): cmp rdi, 0 / je bad_fb; cmp rsi, 0 / je bad_snap; width must be >= 240 (60 samples * 4-px pitch); height must be >= 32 (label 8 + gap 2 + sparkline 22). Phase B (paint widget background): call pwn_gfx_fill_rect(fb, x0, y0, width, height, PWN_COLOR_BG=0xFF202020). Phase C (compute sample = task_seen - prior_task_seen): mov rax, [r12 + 176] (PWN_SNAP_OFF_TASK_SEEN); mov rcx, [rip + _pwn_prior_task_seen]; sub rax, rcx (unsigned wrap OK; the delta is small and non-negative when the ring is warm). Clamp to [0, PWN_SPARK_HEIGHT_PX-1]=21: cmp rax, 21; jbe sample_ok; mov rax, 21; sample_ok: mov [rsp+8], rax. Update _pwn_prior_task_seen: mov rax, [r12 + 176]; mov [rip + _pwn_prior_task_seen], rax. Phase D (insert sample into ring[0][head]; iface 0 = offset 0): mov rax, [rip + _pwn_ring_head]; mov rcx, rax; shl rcx, 3 (slot offset = head*8); mov rdx, [rsp+8] (sample); lea rdi, [rip + _pwn_ring]; mov [rdi + rcx], rdx (ring[0][head] = sample). head = (head + 1) mod RING_LEN: add rax, 1; cmp rax, 60; jb head_ok; xor rax, rax; head_ok: mov [rip + _pwn_ring_head], rax. Phase E (draw baseline horizontal reference at bottom of sparkline area): call pwn_gfx_fill_rect(fb, x0, y0+PWN_SPARK_TOP_OFFSET_PX+PWN_SPARK_HEIGHT_PX-1=y0+31, PWN_RING_LEN*PWN_SAMPLE_X_PITCH_PX=240, 1, PWN_COLOR_TRACK=0xFF404040). Phase F (draw label glyph strip at row y0): 9 iterations of pwn_gfx_draw_glyph at (x0 + 8*i, y0) with fg=PWN_COLOR_LABEL, bg=PWN_COLOR_BG, glyph=i (ignored by stub). Loop label_i cursor at [rsp+48]. Phase G (draw sparkline): iterate i=0..RING_LEN, compute ring_idx = (head + i) mod RING_LEN (head is the NEXT-INSERT slot, so ring[head] is the OLDEST unread sample; iterating head..head+59 yields oldest-first in temporal order), sample = ring[0][ring_idx], clamp to 21, cur_x = x0 + i*4 (shl 2), cur_y = y0 + 31 - sample (baseline at y0+31, top at y0+10; sample=0 draws at baseline, sample=21 draws at top). For i>0, call pwn_gfx_draw_line(fb, prev_x, prev_y, cur_x, cur_y, PWN_COLOR_SPARK=0xFF00C0C0). Update prev = cur before next iteration. Phase H (fingerprint one-shot): call pwn_emit_fingerprint. Phase I (return 0): xor rax, rax; unwind (add rsp, 64; 5-pop; ret). Error tails: mov rax, sentinel; unwind. Encoder discipline: no test (all cmp reg, 0 / cmp reg, N); no imul (every multiplication power-of-two: shl 2 for x-pitch and pixel-stride, shl 3 for glyph advance and ring slot pitch, shl 10 for stride inside pwn_gfx_fill_rect); no `and reg, imm64`; no `cmp reg, [mem]` (every compare loads through a scratch first); no `sub reg, [mem]`; no `mul`; no `neg`. Every 32-bit pixel store lives inside pwn_gfx_fill_rect (mov_d). Every color constant loaded via mov reg, imm (movabs form for the 0xFF-prefixed 4-byte values). Immediates in cmp fit imm8 (0, 8, 9, 21, 32, 60, 240); mov-immediates that need imm32 (72, 176) never appear in cmp/and. Labels prefixed pwn_nwr_* (no reserved keyword substrings; used _sample_ok / _head_ok / _lbl_step / _spark_step / _ringidx_ok / _clamp_ok / _no_line / _bad_ / _rect_small).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 64;                              // 8 stack slots
+
+        // ---- Phase A: argument validation ---------------------------------
+        cmp rdi, 0;
+        je pwn_nwr_bad_fb;
+        cmp rsi, 0;
+        je pwn_nwr_bad_snap;
+        // width >= 240 required (60 samples * 4-px pitch)
+        cmp r8, 240;
+        jb pwn_nwr_rect_small;
+        // height >= 32 required (label 8 + gap 2 + sparkline 22)
+        cmp r9, 32;
+        jb pwn_nwr_rect_small;
+
+        mov rbx, rdi;                             // rbx = fb_ptr
+        mov r12, rsi;                             // r12 = snap_ptr
+        mov r13, rdx;                             // r13 = x0
+        mov r14, rcx;                             // r14 = y0
+        mov r15, r8;                              // r15 = width
+        mov [rsp + 0], r9;                        // height
+
+        // ---- Phase B: paint widget-rect background ------------------------
+        mov rdi, rbx;
+        mov rsi, r13;                             // x0
+        mov rdx, r14;                             // y0
+        mov rcx, r15;                             // width
+        mov r8, [rsp + 0];                        // height
+        mov r9, 0xFF202020;                       // PWN_COLOR_BG
+        call pwn_gfx_fill_rect;
+
+        // ---- Phase C: sample = task_seen - prior_task_seen, clamp[0..21] --
+        mov rax, [r12 + 176];                     // PWN_SNAP_OFF_TASK_SEEN
+        mov rcx, [rip + _pwn_prior_task_seen];
+        sub rax, rcx;                             // sample (wrap OK)
+        cmp rax, 21;                              // PWN_SPARK_HEIGHT_PX - 1
+        jbe pwn_nwr_sample_ok;
+        mov rax, 21;
+        pwn_nwr_sample_ok:
+        mov [rsp + 8], rax;                       // sample
+
+        // Update _pwn_prior_task_seen for the next refresh.
+        mov rax, [r12 + 176];
+        mov [rip + _pwn_prior_task_seen], rax;
+
+        // ---- Phase D: insert sample into ring[0][head] --------------------
+        // iface 0 -> base offset 0; slot offset = head * 8
+        mov rax, [rip + _pwn_ring_head];
+        mov rcx, rax;
+        shl rcx, 3;                               // slot offset bytes
+        mov rdx, [rsp + 8];                       // sample
+        lea rdi, [rip + _pwn_ring];
+        mov [rdi + rcx], rdx;                     // ring[0][head] = sample
+        // head = (head + 1) mod RING_LEN
+        add rax, 1;
+        cmp rax, 60;                              // PWN_RING_LEN
+        jb pwn_nwr_head_ok;
+        xor rax, rax;                             // wrap to 0
+        pwn_nwr_head_ok:
+        mov [rip + _pwn_ring_head], rax;
+
+        // ---- Phase E: draw sparkline baseline (bottom horizontal) --------
+        // baseline_y = y0 + 31 (bottom of sparkline area);
+        // width = RING_LEN * X_PITCH = 240; height = 1; color = TRACK
+        mov rdi, rbx;
+        mov rsi, r13;                             // x0
+        mov rdx, r14;
+        add rdx, 31;                              // y = y0 + 31 (baseline)
+        mov rcx, 240;                             // width = 60 * 4
+        mov r8, 1;                                // height = 1
+        mov r9, 0xFF404040;                       // PWN_COLOR_TRACK
+        call pwn_gfx_fill_rect;
+
+        // ---- Phase F: draw the 9-glyph label cell strip -------------------
+        xor rax, rax;
+        mov [rsp + 48], rax;                      // label_i = 0
+
+        pwn_nwr_lbl_step:
+        mov rax, [rsp + 48];
+        cmp rax, 9;                               // PWN_LABEL_GLYPH_COUNT
+        jae pwn_nwr_lbl_end;
+
+        // glyph_x = x0 + label_i * 8
+        mov rdi, rbx;                             // fb
+        mov rcx, rax;                             // label_i
+        shl rcx, 3;                               // label_i * 8
+        mov rsi, r13;
+        add rsi, rcx;                             // rsi = glyph_x
+        mov rdx, r14;                             // y = y0 (label row)
+        mov rcx, [rsp + 48];                      // glyph = label_i (stub)
+        mov r8, 0xFFE0E0E0;                       // PWN_COLOR_LABEL (fg)
+        mov r9, 0xFF202020;                       // PWN_COLOR_BG (bg)
+        // STUB(libpdx-font.M2-001): retire when libpdx-font glyph store lands.
+        call pwn_gfx_draw_glyph;
+
+        mov rax, [rsp + 48];
+        add rax, 1;
+        mov [rsp + 48], rax;
+        jmp pwn_nwr_lbl_step;
+        pwn_nwr_lbl_end:
+
+        // ---- Phase G: sparkline sample loop -------------------------------
+        // Iterate i=0..RING_LEN, computing (cur_x, cur_y) from
+        // ring[0][(head + i) mod RING_LEN]. On i>0 draw line from
+        // (prev_x, prev_y) to (cur_x, cur_y). i=0 seeds prev only.
+        xor rax, rax;
+        mov [rsp + 48], rax;                      // iter_i = 0
+
+        pwn_nwr_spark_step:
+        mov rax, [rsp + 48];
+        cmp rax, 60;                              // PWN_RING_LEN
+        jae pwn_nwr_spark_end;
+
+        // ring_idx = (head + i) mod RING_LEN
+        mov rcx, [rip + _pwn_ring_head];
+        add rcx, rax;                             // head + i
+        cmp rcx, 60;
+        jb pwn_nwr_ringidx_ok;
+        // wrap: rcx -= 60. Since we added at most 59 to a value in [0..59],
+        // one subtract suffices.
+        mov rdx, 60;
+        sub rcx, rdx;
+        pwn_nwr_ringidx_ok:
+
+        // sample_ptr = &_pwn_ring[0] + ring_idx * 8
+        shl rcx, 3;                               // slot offset bytes
+        lea rdx, [rip + _pwn_ring];
+        add rdx, rcx;
+        mov rdx, [rdx + 0];                       // sample value
+
+        // clamp sample to [0..21] (sparkline_h - 1)
+        cmp rdx, 21;
+        jbe pwn_nwr_clamp_ok;
+        mov rdx, 21;
+        pwn_nwr_clamp_ok:
+
+        // cur_x = x0 + i * 4  (shl 2)
+        mov rcx, rax;                             // i
+        shl rcx, 2;                               // i * 4
+        mov rax, r13;                             // x0
+        add rax, rcx;                             // cur_x
+        mov [rsp + 32], rax;                      // cur_x
+
+        // cur_y = y0 + 31 - sample  (baseline y0+31, top y0+10)
+        mov rax, r14;                             // y0
+        add rax, 31;                              // y0 + 31
+        sub rax, rdx;                             // - sample
+        mov [rsp + 40], rax;                      // cur_y
+
+        // If iter_i > 0 draw a line from prev to cur; else just seed prev.
+        mov rax, [rsp + 48];
+        cmp rax, 0;
+        je pwn_nwr_spark_no_line;
+
+        // Draw line: pwn_gfx_draw_line(fb, prev_x, prev_y, cur_x, cur_y, color)
+        mov rdi, rbx;
+        mov rsi, [rsp + 16];                      // prev_x
+        mov rdx, [rsp + 24];                      // prev_y
+        mov rcx, [rsp + 32];                      // cur_x
+        mov r8, [rsp + 40];                       // cur_y
+        mov r9, 0xFF00C0C0;                       // PWN_COLOR_SPARK
+        // STUB(libpdx-gfx.M2-003): retire when gfx_draw_line lands.
+        call pwn_gfx_draw_line;
+
+        pwn_nwr_spark_no_line:
+
+        // prev = cur
+        mov rax, [rsp + 32];
+        mov [rsp + 16], rax;                      // prev_x = cur_x
+        mov rax, [rsp + 40];
+        mov [rsp + 24], rax;                      // prev_y = cur_y
+
+        // i++
+        mov rax, [rsp + 48];
+        add rax, 1;
+        mov [rsp + 48], rax;
+        jmp pwn_nwr_spark_step;
+
+        pwn_nwr_spark_end:
+
+        // ---- Phase H: fingerprint (one-shot) ------------------------------
+        call pwn_emit_fingerprint;
+
+        // ---- Phase I: success return --------------------------------------
+        xor rax, rax;                             // PWN_OK
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pwn_nwr_bad_fb:
+        mov rax, 0xFFFFE230;                      // PWN_ERR_BAD_FB_PTR
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pwn_nwr_bad_snap:
+        mov rax, 0xFFFFE231;                      // PWN_ERR_BAD_SNAP_PTR
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pwn_nwr_rect_small:
+        mov rax, 0xFFFFE232;                      // PWN_ERR_RECT_TOO_SMALL
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

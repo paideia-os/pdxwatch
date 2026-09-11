@@ -9,6 +9,83 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ### Added
 
+- **v1.2-C -- M2-003 network sparkline widget** (pdxwatch#5).
+  - `src/widget_net.pdx` (new, `module WidgetNet`): per-interface
+    bytes/s sparkline render widget. Maintains a fixed-size circular
+    ring of the last 60 samples per interface (`_pwn_ring`,
+    MAX_NIFS=4 * RING_LEN=60 * 8 bytes = 1920 bytes; iface 0 populated
+    at v1.2-C, other slots reserved for a real multi-iface
+    `sys_netinfo` landing). At 1 Hz refresh cadence 60 samples cover
+    ~1 min of history. Renders as a label strip (9 glyph cells at
+    row `y0`) + a baseline track row + 59 connected line segments
+    across the 60-sample ring, all painted into a caller-supplied
+    BGRA8888 framebuffer. Fingerprint `pdxwatch net-widget ok\n`
+    emitted once on first successful render via SC+ sysno 12
+    (`sys_debug_puts`).
+  - Entry point: `WidgetNet::net_widget_render(fb_ptr, snap_ptr,
+    x0, y0, width, height) -> u64`. Extended-arity vs the R102.M2-003
+    issue's 5-arg shape: `snap_ptr` passed explicitly for the same
+    M1-era reason peer widgets use. All three signatures narrow back
+    to 5 args together when M1-002 introduces a widget-registry
+    global.
+  - Net-stat source (M1-era proxy; no `sys_netinfo` on paideia-os
+    HEAD -- verified via grep of `design/user/syscall-table.md` and
+    the socket band 86..103 which surfaces no per-interface byte
+    counter): `sample = task_seen - prior_task_seen` (unsigned wrap
+    OK; `_pwn_prior_task_seen` carries the previous-tick value in
+    widget-owned .bss scratch). Sample is intentionally left in
+    task-delta units rather than pre-scaled to KB/s -- task_seen is
+    bounded by PW_MAX_TASKS=64 so `min(sparkline_h - 1, sample)`
+    clamp gives exact per-pixel resolution without a runtime
+    multiply. Retires without shape churn when
+    sys_netinfo / KIND_NET_STAT-invoke lands.
+  - Ring buffer semantics: `_pwn_ring_head` names the NEXT-INSERT
+    slot; iterating head..head+59 mod RING_LEN yields oldest-first
+    in temporal order (sparkline draws left-to-right).
+    `_pwn_ring[iface][slot]` at byte offset `(iface * 60 + slot) * 8`;
+    per-iface stride 480 (non-power-of-two but iface 0 = offset 0 at
+    v1.2-C so no runtime multiply needed).
+  - Color scheme (cyan sparkline over dark charcoal, distinct from
+    WidgetCpu's green/yellow/red warning gradient and WidgetMem's
+    dark-to-light blue ramp so users parse the three stacked widgets
+    as three independent quantities):
+      - `PWN_COLOR_SPARK = 0xFF00C0C0` cyan (sparkline segments)
+      - `PWN_COLOR_TRACK = 0xFF404040` medium charcoal (baseline)
+      - `PWN_COLOR_BG` and `PWN_COLOR_LABEL` match peer widgets.
+  - **Inline libpdx-gfx / libpdx-font stubs** (`pwn_gfx_fill_rect`,
+    `pwn_gfx_draw_glyph`): byte-for-byte replicas of WidgetCpu's /
+    WidgetMem's stubs, prefixed `pwn_*` so a future wire-up round
+    does not collide on link. New this round: `pwn_gfx_draw_line`
+    (staircase step-chart shape -- horizontal fill_rect from
+    (x0, y0) to (x1, y0) plus a vertical fill_rect at x1 spanning
+    [min(y0,y1)..max(y0,y1)]) marks `// STUB(libpdx-gfx.M2-003)`.
+    All three widget stubs retire together when libpdx-gfx.M2-002
+    (`gfx_fill_rect`) + libpdx-gfx.M2-003 (`gfx_draw_line`) +
+    libpdx-font.M2-001 (`gfx_draw_glyph`) land. The follow-up
+    dependency issue ("pdxwatch: retire widget_cpu.pdx /
+    widget_mem.pdx / widget_net.pdx libpdx-gfx + libpdx-font stubs")
+    now covers all three widgets together.
+  - Error-band claim extended: `0xFFFFE230..0xFFFFE23F` (widget's
+    fault surface: `PWN_ERR_BAD_FB_PTR`, `PWN_ERR_BAD_SNAP_PTR`,
+    `PWN_ERR_RECT_TOO_SMALL`); Collectors', WidgetCpu's, and
+    WidgetMem's earlier holdings unchanged.
+  - `src/main.pdx`: bounded-iterate loop now calls
+    `net_widget_render` right after `mem_widget_render` on every
+    refresh return of 1. `_pw_fb` grows from `[u8; 98304]`
+    (256x96 rows) to `[u8; 131072]` (256x128 rows) to accommodate
+    the net widget at (x0=0, y0=96, w=256, h=32). Peer widgets'
+    geometry unchanged; rows 94..95 remain visual gap between the
+    mem bar and the sparkline. Updated row-map table lives in
+    main.pdx's `_pw_fb` comment.
+  - `caps.decl`: `sys_debug_puts @ 12` note extended to record
+    the WidgetNet fingerprint emitter shares the syscall (no new
+    entry needed; kernel dispatch is idempotent across all three
+    widgets' one-shot emits).
+  - `manifest.pdxproj`: `sources:` block promotes
+    `src/widget_net.pdx` from commented forward-declaration to
+    live entry.
+  - Closes #5.
+
 - **v1.2-B -- M2-002 memory tri-color widget** (pdxwatch#4).
   - `src/widget_mem.pdx` (new, `module WidgetMem`): tri-color memory
     bar render widget. Reads `CollectSnapshot.total_rss_kb` (offset

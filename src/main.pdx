@@ -2,6 +2,7 @@
 //                -- v1.1-A real-body landing (pdxwatch#11)
 //                -- v1.2-A CPU-widget wire-in (pdxwatch#3)
 //                -- v1.2-B mem-widget wire-in (pdxwatch#4)
+//                -- v1.2-C net-widget wire-in (pdxwatch#5)
 //
 // Main::main entry point + fixed-cadence dispatch loop skeleton.
 //
@@ -128,8 +129,8 @@ module Main = structure {
 
   // ==========================================================================
   // Stub framebuffer for the M2-001 CPU-bar-per-core widget (added
-  // pdxwatch#3 v1.2-A). 256 pixels wide, 96 pixels tall, BGRA8888
-  // (4 bytes/pixel) -> 98304 bytes, stride 1024 bytes/row. Lives in
+  // pdxwatch#3 v1.2-A). 256 pixels wide, 128 pixels tall, BGRA8888
+  // (4 bytes/pixel) -> 131072 bytes, stride 1024 bytes/row. Lives in
   // .bss (zero-initialized at load).
   //
   // This is a M1-era stopgap: when libpdx-gfx.M1-002 lands the real
@@ -142,15 +143,21 @@ module Main = structure {
   // absent compositor.
   //
   // Dimensions were chosen to match WidgetCpu's PWC_FB_STRIDE_BYTES
-  // = 1024 (== 256 * 4) constant. Height = 96 fits 8 CPU rows at
-  // PWC_BAR_ROW_PITCH = 10 px + top margin. v1.2-B (pdxwatch#4)
-  // reuses the same _pw_fb for the memory tri-color widget stacked
-  // below the CPU rows: rows 0..79 = 8 CPU rows, rows 80..83 = gap,
-  // rows 84..95 = memory bar (10 px allocation, 8-px bar + margin).
-  // Any resize churns both this allocation and WidgetCpu/WidgetMem's
+  // = 1024 (== 256 * 4) constant. v1.2-C (pdxwatch#5) grew the height
+  // from 96 to 128 rows to accommodate WidgetNet's 32-row sparkline
+  // stacked below the mem bar. Row-map at v1.2-C:
+  //
+  //   rows   0..79   CPU widget       (h=80; 8 CPUs * PWC_BAR_ROW_PITCH=10)
+  //   rows  80..83   gap
+  //   rows  84..93   memory tri-color widget  (h=10; 8-px bar + 2-px margin)
+  //   rows  94..95   gap
+  //   rows  96..127  network sparkline widget (h=32; label 8 + gap 2
+  //                                            + sparkline 22)
+  //
+  // Any further resize churns this allocation and every widget's
   // stride constants in one pass.
   // ==========================================================================
-  pub let mut _pw_fb : [u8; 98304] = uninit @align(64)
+  pub let mut _pw_fb : [u8; 131072] = uninit @align(64)
 
   // ==========================================================================
   // pw_sys_exit(status) -> !
@@ -287,6 +294,26 @@ module Main = structure {
         mov r8, 256;                               // width
         mov r9, 10;                                // height
         call mem_widget_render;
+        // v1.2-C (pdxwatch#5): net sparkline widget stacked below the
+        // mem bar. Placed at (x0=0, y0=96, w=256, h=32) inside the
+        // same _pw_fb stub back-buffer (grown at v1.2-C from 96 rows
+        // to 128 rows to hold this widget's 32-row footprint). The
+        // 2-px vertical gap (rows 94..95) is background paint from
+        // the fill(bg) all widgets do first; visually separates the
+        // mem bar from the sparkline. Args:
+        //   rdi = _pw_fb         (256x128 BGRA stub back-buffer)
+        //   rsi = _pw_snapshot   (populated by collect_tick)
+        //   rdx = 0              (x0 = left edge)
+        //   rcx = 96             (y0; leaves rows 94..95 as visual gap)
+        //   r8  = 256            (widget width)
+        //   r9  = 32             (widget height; 8 label + 2 gap + 22 spark)
+        lea rdi, [rip + _pw_fb];                   // fb_ptr
+        mov rsi, r12;                              // snap_ptr
+        xor rdx, rdx;                              // x0 = 0
+        mov rcx, 96;                               // y0 = 96
+        mov r8, 256;                               // width
+        mov r9, 32;                                // height
+        call net_widget_render;
         pw_main_no_render:
         add rbx, 1;
         jmp pw_main_iter_step;
