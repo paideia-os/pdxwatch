@@ -5,6 +5,77 @@ adheres to a Keep-a-Changelog-style shape: newest version first, one
 section per released tag, dated `YYYY-MM-DD`. Categories used:
 `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`, `Security`.
 
+## [Unreleased]
+
+### Added
+
+- **v1.2-A -- M2-001 CPU bar-per-core widget** (pdxwatch#3).
+  - `src/widget_cpu.pdx` (new, `module WidgetCpu`): per-online-CPU
+    load-bar render widget. Reads `CollectSnapshot.num_cpus` +
+    `per_cpu_active[0..8]` and renders one horizontal bar per online
+    CPU into a caller-supplied BGRA8888 framebuffer. Bar width scales
+    to a load% proxy (per-CPU RUNNING task count * 25, saturating at
+    100 at 4 concurrent tasks); color gradient at 50%/80% thresholds
+    (green / yellow / red). Labels drawn as a 9-glyph strip via
+    `pwc_gfx_draw_glyph`. Fingerprint `pdxwatch cpu-widget ok\n`
+    emitted once on first successful render via SC+ sysno 12
+    (`sys_debug_puts`).
+  - Entry point: `WidgetCpu::cpu_widget_render(fb_ptr, snap_ptr, x0,
+    y0, width, height) -> u64`. Extended-arity vs the R102.M2-001
+    issue's 5-arg shape: `snap_ptr` is passed explicitly because
+    pdxwatch's M1 era has no shared-global snapshot slot. Narrows
+    back to the 5-arg shape when M1-002 introduces a widget-registry
+    global.
+  - MAX_CPUS = 8 (matches Collectors' `PW_MAX_CPUS` -- rendering
+    ceiling, not the M1-era hard-coded `num_cpus = 1`).
+  - Load% derivation: `min(100, per_cpu_active[i] * 25)` -- the M1-era
+    stopgap. The R102.M2-001 issue names the ideal
+    `(cpu_ticks * 100) / (cpu_ticks + idle_ticks)` formula; neither
+    `idle_ticks` nor per-CPU `cpu_ticks` is surfaced by paideia-os
+    HEAD's SC+ layer, so the widget uses per-CPU RUNNING-task count
+    as a load proxy. `_pwc_prior_total_cpu_ticks` / `_pwc_prior_
+    refresh_count` scratch reserved for the sys_cpuinfo landing.
+  - **Inline libpdx-gfx / libpdx-font stubs**: `pwc_gfx_fill_rect`
+    (BGRA rect fill using sized `mov_d` 32-bit stores) and
+    `pwc_gfx_draw_glyph` (8x8 solid-cell fill stub) are inlined
+    here since libpdx-gfx.M2-002 (`gfx_fill_rect`) and libpdx-
+    font.M2-001 (`gfx_draw_glyph`) have not landed in the pdxwatch
+    link path (nor are either library resident in the paideia-os
+    monorepo). Every stub carries a `// STUB(libpdx-*.M2-*)` marker
+    at the callsite. A follow-up dependency issue ("pdxwatch: retire
+    widget_cpu.pdx libpdx-gfx/font stubs when M2-002 / M2-001 land")
+    should be filed against `paideia-os/pdxwatch` when M1-002 opens
+    the surface_open wire.
+  - Error-band claim extended: `0xFFFFE210..0xFFFFE21F` (widget's
+    fault surface: `PWC_ERR_BAD_FB_PTR`, `PWC_ERR_BAD_SNAP_PTR`,
+    `PWC_ERR_RECT_TOO_SMALL`); collectors' `0xFFFFE200..0xFFFFE20F`
+    holdings unchanged.
+  - `src/main.pdx`: adds `_pw_fb : [u8; 98304] @align(64)` .bss
+    stub framebuffer (256x96 BGRA, stride 1024 bytes); modifies
+    the bounded-iterate loop to call `cpu_widget_render` after
+    each `collect_tick` return of 1 (refresh happened). The
+    bounded-iterate exit trigger remains `PW_MAIN_TICK_BUDGET`
+    iterations, not refresh count.
+  - `caps.decl`: `syscalls:` block gains `sys_debug_puts @ 12`
+    (WidgetCpu fingerprint emit).
+  - `manifest.pdxproj`: `sources:` block promotes
+    `src/widget_cpu.pdx` from commented forward-declaration to
+    live entry.
+
+### Notes
+
+- The fingerprint `pdxwatch cpu-widget ok` is emitted through
+  `sys_debug_puts` (kernel-owned debug channel, bypasses fd
+  routing). A boot smoke that runs pdxwatch under QEMU can grep
+  the serial console for this string to gate M2-001 "widget wired
+  and firing" verification. Emission is one-shot per process
+  lifetime (`_pwc_fp_emitted` flag) so the 1Hz refresh loop does
+  not spam the console.
+- `WidgetCpu::PWC_FB_STRIDE_BYTES = 1024` is hard-coded to match
+  the `_pw_fb` stub's row pitch. When gfx_surface_open lands and
+  SurfaceHandle carries stride, `cpu_widget_render` gains a
+  `stride_bytes` parameter and this constant is deleted.
+
 ## [1.1.0] - 2026-09-08
 
 Track-C "real body + semantic-pipe emit" pass. The M1-001 scaffold

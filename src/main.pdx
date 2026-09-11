@@ -1,5 +1,6 @@
 // src/main.pdx -- pdxwatch.M1-001 (paideia-os/pdxwatch#1)
 //                -- v1.1-A real-body landing (pdxwatch#11)
+//                -- v1.2-A CPU-widget wire-in (pdxwatch#3)
 //
 // Main::main entry point + fixed-cadence dispatch loop skeleton.
 //
@@ -125,6 +126,28 @@ module Main = structure {
   pub let mut _pw_snapshot : [u8; 256] = uninit @align(64)
 
   // ==========================================================================
+  // Stub framebuffer for the M2-001 CPU-bar-per-core widget (added
+  // pdxwatch#3 v1.2-A). 256 pixels wide, 96 pixels tall, BGRA8888
+  // (4 bytes/pixel) -> 98304 bytes, stride 1024 bytes/row. Lives in
+  // .bss (zero-initialized at load).
+  //
+  // This is a M1-era stopgap: when libpdx-gfx.M1-002 lands the real
+  // gfx_surface_open primitive, Main::main gets a real KIND_SURFACE
+  // (see design/graphics/r102-user-plan.md §7.2.1) and this _pw_fb
+  // .bss allocation retires in favor of the KIND_MEMORY-backed
+  // surface backing store. Until then, the widget renders into this
+  // stub back-buffer so its full render path (bar / label / color /
+  // fingerprint) is exercised at every refresh regardless of the
+  // absent compositor.
+  //
+  // Dimensions were chosen to match WidgetCpu's PWC_FB_STRIDE_BYTES
+  // = 1024 (== 256 * 4) constant. Height = 96 fits 8 CPU rows at
+  // PWC_BAR_ROW_PITCH = 10 px + top margin. Any resize churns both
+  // this allocation and WidgetCpu's stride constant in one pass.
+  // ==========================================================================
+  pub let mut _pw_fb : [u8; 98304] = uninit @align(64)
+
+  // ==========================================================================
   // pw_sys_exit(status) -> !
   //
   // Never-returning wrapper around SC+ sysno 60 (sys_exit). rdi is
@@ -202,12 +225,41 @@ module Main = structure {
         call collect_init;
 
         // ---- Phase B: bounded iterate --------------------------------------
+        // v1.2-A (pdxwatch#3): after each collect_tick, if rax==1
+        // (refreshed), call WidgetCpu::cpu_widget_render into the
+        // .bss stub framebuffer (_pw_fb). rax==0 (interval not yet
+        // elapsed) skips the render call. This wires the M2-001
+        // widget into the 1Hz refresh cadence without changing the
+        // bounded-iterate exit trigger (still PW_MAIN_TICK_BUDGET
+        // iterations, not refresh count).
+        //
+        // Widget-call args:
+        //   rdi = _pw_fb         (256x96 BGRA stub back-buffer)
+        //   rsi = _pw_snapshot   (populated by collect_tick)
+        //   rdx = 0              (x0 = left edge)
+        //   rcx = 0              (y0 = top edge)
+        //   r8  = 256            (widget width; matches _pw_fb width)
+        //   r9  = 96             (widget height; matches _pw_fb height)
+        //
+        // Register roles preserved across the widget call: rbx (iter
+        // cursor) and r12 (snap_ptr) are both SysV callee-save, so
+        // the widget's callee-save discipline preserves both.
         xor rbx, rbx;                              // i = 0
         pw_main_iter_step:
         cmp rbx, 32;                               // PW_MAIN_TICK_BUDGET
         jae pw_main_iter_end;
         mov rdi, r12;
         call collect_tick;
+        cmp rax, 0;
+        je pw_main_no_render;
+        lea rdi, [rip + _pw_fb];                   // fb_ptr
+        mov rsi, r12;                              // snap_ptr
+        xor rdx, rdx;                              // x0 = 0
+        xor rcx, rcx;                              // y0 = 0
+        mov r8, 256;                               // width
+        mov r9, 96;                                // height
+        call cpu_widget_render;
+        pw_main_no_render:
         add rbx, 1;
         jmp pw_main_iter_step;
         pw_main_iter_end:

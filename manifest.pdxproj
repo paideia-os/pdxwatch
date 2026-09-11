@@ -56,8 +56,8 @@ caps_decl   = caps.decl
 sources:
   - src/collectors.pdx            # M1-001: CollectSnapshot + collect_init + collect_tick sys_taskinfo aggregator
   - src/main.pdx                  # M1-001: Main::main dispatch loop + pw_sys_exit
+  - src/widget_cpu.pdx            # M2-001 (pdxwatch#3): CPU bar-per-core widget (with libpdx-gfx/font stubs)
   # - src/argv.pdx                # M1-002: argv parser (deferred; blocks on libpdx-argv v1.1.0 in the same wave)
-  # - src/widget_cpu.pdx          # M2-001: CPU bar-per-core widget
   # - src/widget_mem.pdx          # M2-002: memory tri-color widget
   # - src/widget_net.pdx          # M2-003: network sparkline widget
   # - src/input.pdx               # M3-001: click-cycle + 'q' quit input handler
