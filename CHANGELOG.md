@@ -9,6 +9,69 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ### Added
 
+- **v1.4-A -- M4-001 seeded-stat render smoke** (pdxwatch#7).
+  - `tests/test_seeded_stat_smoke.pdx` (new, `module TestSeededStatSmoke`):
+    boot-smoke witness for the M2 widget stack (CPU / mem / net).
+    Bypasses the real `sys_taskinfo` aggregation path, seeds a
+    private `CollectSnapshot` .bss slot with known fixture values
+    (4 CPUs at 50% via `per_cpu_active[0..4]=2`, 8 GiB used via
+    `total_rss_kb=8388608`, network activity proxy via
+    `task_seen=15`), drives `cpu_widget_render`, `mem_widget_render`,
+    `net_widget_render` in turn against a private 256x128 BGRA
+    back-buffer, computes per-widget sum-of-qwords digests over
+    CPU rows `[0..79]`, mem rows `[84..93]`, net rows `[96..127]`,
+    compares to hardcoded expected constants, and emits the
+    serial-console fingerprint `pdxwatch seeded-stat ok\n` (24 bytes)
+    via SC+ sysno 12 sys_debug_puts on all-pass. Fail-code band
+    `0xFFFFE2F0..0xFFFFE2F5` per the M4-001 reservation in
+    `manifest.pdxproj`:
+    - `SSS_FAIL_CPU_DIGEST` / `SSS_FAIL_MEM_DIGEST` /
+      `SSS_FAIL_NET_DIGEST` (0xFFFFE2F0..0xFFFFE2F2) -- per-widget
+      digest mismatch.
+    - `SSS_FAIL_CPU_RENDER_ERR` / `SSS_FAIL_MEM_RENDER_ERR` /
+      `SSS_FAIL_NET_RENDER_ERR` (0xFFFFE2F3..0xFFFFE2F5) -- widget
+      render entry returned a non-zero refuse code (arg validation:
+      bad fb/snap pointer or too-small rect).
+  - Six `pub let` entries:
+    - `sss_sys_debug_puts(buf, count)` -- thin SC+ sysno 12 wrapper,
+      byte-for-byte replica of the peer widget wrappers.
+    - `sss_seed_snapshot(state_ptr)` -- zero-fills 256 bytes then
+      stamps interval_ticks=60, num_cpus=4, per_cpu_active[0..4]=2,
+      total_rss_kb=8388608, task_seen=15 (offsets 0, 24, 32..56,
+      104, 176 respectively -- mirror `src/collectors.pdx`
+      `PW_SNAP_OFF_*`).
+    - `sss_digest_subrect(fb_ptr, y_start, y_count)` -- sum-of-qwords
+      fold over the rectangle rows `[y_start .. y_start + y_count)`,
+      full 1024-byte row stride (128 qwords/row). Chosen over
+      sum-of-bytes because the paideia-as encoder's `mov_b` byte-load
+      form is documented but unexercised anywhere in the pdxwatch
+      tree; qword loads through `mov rax, [reg + reg]` are exercised
+      at every widget callsite and semantically equivalent for the
+      smoke's deterministic-digest requirement.
+    - `sss_emit_fingerprint()` -- one-shot serial-console emit of
+      `pdxwatch seeded-stat ok\n` via three qword stores +
+      `_sss_fp_emitted` gate; matches the widget fingerprint pattern
+      shared across the M2 landings.
+    - `seeded_stat_smoke()` -- boot-smoke witness orchestrator:
+      seed, render(cpu/mem/net), digest(cpu/mem/net), verify, emit.
+      No fingerprint on any fail path -- silent console is the
+      catches-the-placeholder-not-yet-frozen observable.
+  - **Placeholder-fingerprint policy**: `SSS_EXPECTED_CPU_DIGEST` /
+    `SSS_EXPECTED_MEM_DIGEST` / `SSS_EXPECTED_NET_DIGEST` are seeded
+    at `0xFFFFFFFFFFFFFFFF` -- unreachable for a sum-of-qwords fold
+    over the widget sub-rect volumes (max real digest ~21M). The
+    placeholder ALWAYS mismatches the actual computed digest on the
+    first green build, so the smoke returns a `0xFFFFE2Fx` sentinel
+    on the first run and DOES NOT emit the `pdxwatch seeded-stat ok`
+    fingerprint until the expected constants are frozen. The
+    freeze-after-first-green procedure is documented in the source
+    file's §PLACEHOLDER-FINGERPRINT POLICY.
+  - `manifest.pdxproj` `tests:` block gains the new entry as the
+    first item (M4-001 lands ahead of the already-listed M4-002 /
+    M4-003 entries per the tests-band numeric ordering). The
+    forward-declaration comment ("KIND_SYS_STAT seeding primitive")
+    is rewritten to note the syscall-bypass resolution.
+
 - **v1.3-A -- M3-001 click-cycle detail-toggle + 'q'-quit dispatch**
   (pdxwatch#6).
   - `src/input.pdx` (new, `module Input`): input-event dispatch

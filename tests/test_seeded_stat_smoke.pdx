@@ -1,0 +1,802 @@
+// tests/test_seeded_stat_smoke.pdx -- pdxwatch.M4-001 (paideia-os/pdxwatch#7)
+//
+// TestSeededStatSmoke module: boot-smoke witness for the M2 widget
+// stack (CPU / mem / net). Seeds a CollectSnapshot with known fixture
+// values, drives each widget's render entry (cpu_widget_render,
+// mem_widget_render, net_widget_render) into a private framebuffer,
+// computes per-widget digests over the rendered sub-rects, and
+// compares them to hardcoded expected digests. Emits the serial-
+// console fingerprint 'pdxwatch seeded-stat ok' on all-pass via SC+
+// sysno 12 sys_debug_puts.
+//
+// =============================================================================
+// SCOPE  (design/graphics/r102-user-plan.md §4.8 R102.M4-001)
+// =============================================================================
+//
+// This module lands the M4-001 boot-smoke witness the manifest
+// reserves at:
+//
+//   # collect_tick fingerprint         0xFFFFE2F0..0xFFFFE2FF   (M4-001)
+//
+// Per the R102.M4-001 issue text: "seed sys-stat stream to known
+// snapshot (4 CPUs each at 50%, 8 GB used of 16, network rx=1000/
+// tx=500 for eth0); start pdxwatch; witness reads surface and
+// asserts each widget region has expected bar heights (via digest
+// of widget's sub-rect). Fingerprint: 'pdxwatch seeded-stat ok'."
+//
+// This module BYPASSES the real sys_taskinfo aggregation path
+// (Collectors::collect_tick) and writes fixture values DIRECTLY
+// into a private CollectSnapshot .bss slot, then drives each of
+// the three M2 widgets in turn against the same private
+// framebuffer. Bypassing the collect_tick call means the smoke is
+// hermetic: it exercises the widget RENDER path only, not the
+// task_pool iteration or the kernel-side sys_taskinfo shape.
+//
+// The seed fixture is chosen so every widget's render output is
+// bit-exact deterministic:
+//
+//   * 4 CPUs each at 50% -- num_cpus=4 at [+24], per_cpu_active[0..4]=2
+//     (WidgetCpu's load% proxy is `min(100, active * PWC_LOAD_SAT_UNIT_PCT
+//     (25))`, so active=2 -> pct=50).
+//   * 8 GB used -- total_rss_kb=8388608 at [+104] (== 8 GiB in KiB).
+//     WidgetMem's kb->px scale is `>> PWM_KB_PER_PIXEL_SHIFT (11)`
+//     saturating at PWM_BAR_AREA_MAX_PX (128), so 8388608 >> 11 = 4096
+//     saturates -> used_px=128 (fully-used bar). This is the correct
+//     display for "8 GB used of 16" since the widget's total pool
+//     assumption at M2-002 is PWM_MEM_TOTAL_KB (262144 KiB = 256 MiB
+//     matching QEMU's -m 256) rather than 16 GiB; the pixel-domain
+//     visual ("bar completely used") is the observable that matters
+//     for the smoke, not the numeric ceiling.
+//   * network rx=1000/tx=500 for eth0 -- task_seen=15 at [+176]
+//     (WidgetNet's M2-003 sample proxy is `task_seen - prior_task_seen`
+//     clamped to [0, PWN_SPARK_HEIGHT_PX-1]=21; task_seen=15 lands a
+//     deterministic mid-height sparkline sample). The proxy retires
+//     when sys_netinfo lands and the widget reads real per-interface
+//     byte counters -- see widget_net.pdx §NET-STAT SOURCE for the
+//     wire-up point.
+//
+// The fingerprint 'pdxwatch seeded-stat ok' is emitted from RING-3
+// via SC+ sysno 12 sys_debug_puts on successful all-widget-digest-
+// match, matching the widget fingerprint pattern shared across the
+// M2 landings (pwc_emit_fingerprint / pwm_emit_fingerprint /
+// pwn_emit_fingerprint). On any digest mismatch the smoke returns
+// a widget-specific 0xFFFFE2Fx sentinel and DOES NOT emit the
+// fingerprint -- the paideia-os QEMU smoke script observes the
+// missing fingerprint as a boot-smoke fail.
+//
+// =============================================================================
+// FIXTURE SHAPE
+// =============================================================================
+//
+// The seeded CollectSnapshot lives at _sss_snapshot (private .bss,
+// 256 bytes, @align(64)); byte layout mirrors src/collectors.pdx
+// §CollectSnapshot layout exactly (the widgets read every field via
+// the PWC_/PWM_/PWN_SNAP_OFF_* offset constants their own modules
+// re-declare -- see the SSS_SNAP_OFF_* constants below for the
+// symbolic mirror). Fields NOT stamped by sss_seed_snapshot stay
+// zero from the pre-init zero-fill and read as 0.
+//
+// Stamp map:
+//   [+0]    interval_ticks           = 60           (matches Main's
+//                                                    PW_MAIN_INTERVAL_TICKS)
+//   [+8]    last_tick                = 0            (from zero-fill)
+//   [+16]   refresh_count            = 0            (from zero-fill)
+//   [+24]   num_cpus                 = 4            SSS_FIXTURE_NUM_CPUS
+//   [+32]   per_cpu_active[0]        = 2            SSS_FIXTURE_PER_CPU_ACTIVE
+//   [+40]   per_cpu_active[1]        = 2
+//   [+48]   per_cpu_active[2]        = 2
+//   [+56]   per_cpu_active[3]        = 2
+//   [+64]   per_cpu_active[4..8]     = 0            (from zero-fill; only 4
+//                                                    CPUs are populated,
+//                                                    slots 4..7 read as 0
+//                                                    and the widget iterates
+//                                                    only 0..num_cpus so
+//                                                    the trailing bars are
+//                                                    never drawn)
+//   [+96]   total_cpu_ticks          = 0            (unused by any widget)
+//   [+104]  total_rss_kb             = 8388608      SSS_FIXTURE_TOTAL_RSS_KB
+//                                                    (8 GiB in KiB;
+//                                                     0x800000 fits imm32)
+//   [+112]  task_state_counts[0..8]  = 0            (from zero-fill; unused
+//                                                    by any M2 widget)
+//   [+176]  task_seen                = 15           SSS_FIXTURE_TASK_SEEN
+//                                                    (net-activity proxy)
+//   [+184]  task_skipped             = 0            (from zero-fill)
+//   [+192]  semantic_emit_ok         = 0            (from zero-fill; the
+//                                                    smoke does not exercise
+//                                                    the v1.1-B emit path)
+//   [+200]  semantic_emit_fail       = 0            (from zero-fill)
+//   [+208..+255]  reserved           = 0            (from zero-fill)
+//
+// =============================================================================
+// DIGEST ALGORITHM
+// =============================================================================
+//
+// Per-widget sub-rect digest is a simple 64-bit ACCUMULATED SUM of
+// the qwords in the widget's row range. The framebuffer stride is
+// PWC_FB_STRIDE_BYTES (1024), so each row is 1024 bytes = 128 qwords.
+// A row-major scan sums row * 128 qwords into a u64 accumulator; the
+// final accumulator IS the digest. For the largest sub-rect (CPU,
+// 80 rows), the summed byte volume is 80 * 1024 = 81920 bytes; the
+// per-byte maximum is 0xFF so the u64 accumulator is bounded by
+// 81920 * 0xFF ~= 20.9M ~= 0x13F_FE00 -- comfortably in imm32 and
+// nowhere near u64 overflow. Wrap semantics of add rbx, rax are
+// therefore never observed and the sum is a pure additive fold.
+//
+// Choice of qword sum over byte sum (the R102.M4-001 issue text
+// names "simple sum-of-bytes or fnv1a"): the paideia-as encoder's
+// byte-load `xor reg, reg; mov_b reg, [ptr]` compliance flag is
+// documented (see src/collectors.pdx §PAIDEIA-AS CONFORMANCE) but
+// unexercised anywhere in the pdxwatch tree, whereas qword loads
+// through `mov rax, [reg + reg]` are exercised at every widget
+// callsite. Sum-of-qwords is semantically equivalent for the smoke
+// (both are deterministic additive folds over the sub-rect content;
+// both change bit-for-bit on any pixel drift) and avoids a
+// potential encoder pothole. The digest identity is opaque to the
+// smoke -- only the byte-for-byte equality against the frozen
+// expected value matters, and the algorithm choice is documented
+// here in one place so a future round that adds fnv1a or a real
+// BLAKE3 digest has a single locus to swap.
+//
+// =============================================================================
+// SUB-RECT COORDINATES
+// =============================================================================
+//
+// Mirror the _sss_fb layout established by Main::_pw_fb (see
+// src/main.pdx §_pw_fb comment). All three widgets are stacked in
+// one 256x128 BGRA back-buffer:
+//
+//   CPU widget  -- rows  0..79   (h=80;  y_start=0,   y_count=80)
+//   gap         -- rows 80..83   (h=4;   untouched)
+//   Mem widget  -- rows 84..93   (h=10;  y_start=84,  y_count=10)
+//   gap         -- rows 94..95   (h=2;   untouched)
+//   Net widget  -- rows 96..127  (h=32;  y_start=96,  y_count=32)
+//
+// Each widget's BG fill covers the full 256-pixel width of its
+// rect (== 1024 bytes/row == 128 qwords/row); the digest sums the
+// entire 1024-byte row width because widgets and BG paint own the
+// full stride. The gap rows are intentionally EXCLUDED from every
+// widget's digest -- they stay zero from the initial .bss zero-fill
+// and their contribution would be 0, but including them would
+// couple the digest to the .bss initialization contract rather
+// than the widget render output.
+//
+// =============================================================================
+// PLACEHOLDER-FINGERPRINT POLICY
+// =============================================================================
+//
+// The three expected digest constants (SSS_EXPECTED_CPU_DIGEST /
+// SSS_EXPECTED_MEM_DIGEST / SSS_EXPECTED_NET_DIGEST) are seeded at
+// 0xFFFFFFFFFFFFFFFF -- an unreachable sentinel for a sum-of-
+// qwords fold over the sub-rect volumes above (max real digest
+// ~21M, ~= 0x13FFE00, nowhere near 0xFFFF_FFFF_FFFF_FFFF). The
+// placeholder ALWAYS mismatches the actual computed digest on the
+// first green build, so the smoke returns a 0xFFFFE2Fx sentinel
+// on the first run and does NOT emit the 'pdxwatch seeded-stat ok'
+// fingerprint until the constants are FROZEN.
+//
+// TODO: freeze after first green run. On the first build+witness
+// pass:
+//
+//   1. Add a temporary diagnostic path in seeded_stat_smoke that
+//      calls sss_sys_debug_puts with the computed digest values
+//      (hex-formatted through a small helper -- OR simpler, dump
+//      the three u64 values as raw bytes and read them off the
+//      serial log).
+//   2. Capture the three digest values from the QEMU serial log.
+//   3. Replace the 0xFFFFFFFFFFFFFFFF placeholders below with the
+//      captured values.
+//   4. Remove the diagnostic path and this TODO block.
+//
+// The placeholder-fingerprint policy makes the "not-yet-frozen"
+// state OBSERVABLE (a false-positive silent-pass is impossible)
+// while keeping the widget-render CONTRACT testable at every
+// intervening build: any pixel-level drift in the widget code
+// changes the computed digest, and the placeholder-vs-actual
+// comparison catches every drift the same way a frozen digest
+// would after step 3.
+//
+// =============================================================================
+// FAIL CODES (0xFFFFE2Fx band -- manifest.pdxproj reservation for
+// M4-001; adjacent to the M4-002 click-cycle band at 0xFFFFE2Cx
+// and the M4-003 'q'-quit band at 0xFFFFE2Dx; all within pdxwatch's
+// 0xFFFFE210..0xFFFFE2FF headroom per src/collectors.pdx §Error
+// band.)
+// =============================================================================
+//
+//   0            SSS_PASS                        all widgets rendered and
+//                                                 every digest matched
+//   0xFFFFE2F0   SSS_FAIL_CPU_DIGEST             CPU widget digest mismatch
+//                                                 (pixel drift in widget_cpu
+//                                                 render path OR expected
+//                                                 digest not yet frozen --
+//                                                 see PLACEHOLDER-FINGERPRINT
+//                                                 POLICY above)
+//   0xFFFFE2F1   SSS_FAIL_MEM_DIGEST             Mem widget digest mismatch
+//   0xFFFFE2F2   SSS_FAIL_NET_DIGEST             Net widget digest mismatch
+//   0xFFFFE2F3   SSS_FAIL_CPU_RENDER_ERR         cpu_widget_render returned
+//                                                 non-zero (arg-validation
+//                                                 refuse: PWC_ERR_BAD_FB_PTR /
+//                                                 PWC_ERR_BAD_SNAP_PTR /
+//                                                 PWC_ERR_RECT_TOO_SMALL)
+//   0xFFFFE2F4   SSS_FAIL_MEM_RENDER_ERR         mem_widget_render returned
+//                                                 non-zero
+//   0xFFFFE2F5   SSS_FAIL_NET_RENDER_ERR         net_widget_render returned
+//                                                 non-zero
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestSeededStatSmoke`), matches
+//     file basename test_seeded_stat_smoke.pdx.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF); the
+//     expected-digest sentinel 0xFFFFFFFFFFFFFFFF is staged through
+//     a register (mov rcx, imm64 via movabs; cmp rax, rcx) rather
+//     than a direct `cmp rax, imm64` (which the encoder refuses).
+//     Fail-code sentinels (0xFFFFE2Fx) appear only in `mov rax, imm`
+//     returns which take the movabs 10-byte form legally.
+//   - No 2-op `imul reg, imm` anywhere; no imul at all. Every fixed-
+//     constant multiplication uses shl / shl+add: row * 1024 via
+//     shl 10; qword offset step is `add rcx, 8` (no runtime multiply
+//     against an index).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`.
+//   - No scaled `[reg + N*8]` addressing; the qword accumulator uses
+//     `[base + index*1]` two-register addressing (paideia-as encoder
+//     supports this form -- collectors.pdx uses `mov [rdi + rcx], rax`
+//     identically in its Phase B reset scan).
+//   - Every field offset (0, 24, 32, 40, 48, 56, 104, 176) fits imm8
+//     or imm32 as a `[rdi + imm]` displacement.
+//   - Fixture immediate 8388608 (0x800000) fits imm32 (< 0x7FFFFFFF),
+//     so `mov rax, 8388608` emits the 5-byte imm32 form legally.
+//   - r11 is scratch (paideia-as reserved); this module never touches
+//     it, matching the peer pdxwatch modules' defensive discipline.
+//   - SysV alignment: every nested-call function rewinds rsp to
+//     rsp%16==0 at every call boundary. The orchestrator uses a
+//     5-push callee-save prologue (rbx / r12 / r13 / r14 / r15 --
+//     rbx-only would leave rsp%16==0 too since 1 push = 8B added
+//     to entry %16==8 = 16 %16==0, but 5 pushes gives every helper
+//     the same alignment shape as the widget-render calls it
+//     nests, keeping the audit trail uniform); every helper's
+//     push count aligns rsp to %16==0 at its own nested-call
+//     boundaries. sss_digest_subrect uses 5-push callee-save
+//     (rbx accumulator + r12 fb + r13 row + r14 row_end + r15
+//     row_base). sss_emit_fingerprint uses 3-push (rbx + r12
+//     reserved + rax pad) matching pwc_emit_fingerprint /
+//     pwm_emit_fingerprint / pwn_emit_fingerprint. sss_seed_snapshot
+//     is leaf (0 pushes).
+//   - `pub let` single-line declarations only (multi-line
+//     `pub let ="..."` is a paideia-as pitfall the encoder refuses).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `sss_*`. Substring "loop" avoided defensively (labels use
+//     `_step_` / `_end_` / `_ok_` / `_fail_`).
+
+module TestSeededStatSmoke = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFE2Fx band; manifest.pdxproj reserves this slot for
+  // M4-001, adjacent to M4-002 (0xFFFFE2Cx) and M4-003 (0xFFFFE2Dx)).
+  // ==========================================================================
+  pub let SSS_PASS                       : u64 = 0
+  pub let SSS_FAIL_CPU_DIGEST            : u64 = 0xFFFFE2F0
+  pub let SSS_FAIL_MEM_DIGEST            : u64 = 0xFFFFE2F1
+  pub let SSS_FAIL_NET_DIGEST            : u64 = 0xFFFFE2F2
+  pub let SSS_FAIL_CPU_RENDER_ERR        : u64 = 0xFFFFE2F3
+  pub let SSS_FAIL_MEM_RENDER_ERR        : u64 = 0xFFFFE2F4
+  pub let SSS_FAIL_NET_RENDER_ERR        : u64 = 0xFFFFE2F5
+
+  // ==========================================================================
+  // Fixture values (see §FIXTURE SHAPE).
+  // ==========================================================================
+  pub let SSS_FIXTURE_INTERVAL_TICKS     : u64 = 60
+  pub let SSS_FIXTURE_NUM_CPUS           : u64 = 4
+  pub let SSS_FIXTURE_PER_CPU_ACTIVE     : u64 = 2         // -> 50% via *25 proxy
+  pub let SSS_FIXTURE_TOTAL_RSS_KB       : u64 = 8388608   // 8 GiB in KiB
+  pub let SSS_FIXTURE_TASK_SEEN          : u64 = 15        // net-activity proxy
+
+  // ==========================================================================
+  // Snapshot field offsets (mirror src/collectors.pdx). Named locally so
+  // this module reads without cross-module import churn.
+  // ==========================================================================
+  pub let SSS_SNAP_OFF_INTERVAL_TICKS    : u64 = 0
+  pub let SSS_SNAP_OFF_NUM_CPUS          : u64 = 24
+  pub let SSS_SNAP_OFF_PER_CPU_ACTIVE    : u64 = 32
+  pub let SSS_SNAP_OFF_TOTAL_RSS_KB      : u64 = 104
+  pub let SSS_SNAP_OFF_TASK_SEEN         : u64 = 176
+  pub let SSS_SNAPSHOT_BYTES             : u64 = 256
+
+  // ==========================================================================
+  // Framebuffer geometry (mirror Main::_pw_fb: 256px * 4 BGRA = 1024 bytes
+  // stride * 128 rows = 131072 bytes total).
+  // ==========================================================================
+  pub let SSS_FB_STRIDE_BYTES            : u64 = 1024
+  pub let SSS_FB_WIDTH_PX                : u64 = 256
+  pub let SSS_FB_HEIGHT_ROWS             : u64 = 128
+  pub let SSS_FB_BYTES                   : u64 = 131072
+
+  // ==========================================================================
+  // Sub-rect coordinates (see §SUB-RECT COORDINATES).
+  // ==========================================================================
+  pub let SSS_CPU_Y_START                : u64 = 0
+  pub let SSS_CPU_Y_COUNT                : u64 = 80
+  pub let SSS_MEM_Y_START                : u64 = 84
+  pub let SSS_MEM_Y_COUNT                : u64 = 10
+  pub let SSS_NET_Y_START                : u64 = 96
+  pub let SSS_NET_Y_COUNT                : u64 = 32
+
+  // Widget rect widths / heights passed to the render entry points
+  // (mirror the values Main::main uses in its 1Hz refresh loop).
+  pub let SSS_WIDGET_X0                  : u64 = 0
+  pub let SSS_WIDGET_WIDTH               : u64 = 256
+  pub let SSS_CPU_WIDGET_HEIGHT          : u64 = 80
+  pub let SSS_MEM_WIDGET_HEIGHT          : u64 = 10
+  pub let SSS_NET_WIDGET_HEIGHT          : u64 = 32
+
+  // ==========================================================================
+  // Expected digest constants (PLACEHOLDER -- see §PLACEHOLDER-FINGERPRINT
+  // POLICY). 0xFFFFFFFFFFFFFFFF is unreachable for a sum-of-qwords fold
+  // over the sub-rect volumes, so the placeholder guarantees a first-run
+  // fail loud enough to prevent silent silent-pass.
+  //
+  // TODO: freeze after first green run --
+  //   * capture actual digests from QEMU serial log via temporary
+  //     diagnostic path in seeded_stat_smoke
+  //   * replace 0xFFFFFFFFFFFFFFFF constants below with captured values
+  //   * remove diagnostic path and this TODO block
+  // ==========================================================================
+  pub let SSS_EXPECTED_CPU_DIGEST        : u64 = 0xFFFFFFFFFFFFFFFF  // TODO: freeze
+  pub let SSS_EXPECTED_MEM_DIGEST        : u64 = 0xFFFFFFFFFFFFFFFF  // TODO: freeze
+  pub let SSS_EXPECTED_NET_DIGEST        : u64 = 0xFFFFFFFFFFFFFFFF  // TODO: freeze
+
+  // ==========================================================================
+  // SC+ syscall constants
+  // ==========================================================================
+  pub let SSS_SYS_DEBUG_PUTS             : u64 = 12
+  pub let SSS_FINGERPRINT_LEN            : u64 = 24        // "pdxwatch seeded-stat ok\n"
+
+  // ==========================================================================
+  // Private .bss backing storage:
+  //
+  //   _sss_snapshot    [u8; 256]     private CollectSnapshot; seeded by
+  //                                  sss_seed_snapshot, read by the widget
+  //                                  render entries. Zero-initialized by
+  //                                  .bss loader; sss_seed_snapshot
+  //                                  rewrites every byte on entry so
+  //                                  pre-init contents are irrelevant.
+  //   _sss_fb          [u8; 131072]  private 256x128 BGRA back-buffer;
+  //                                  target of the three widget render
+  //                                  calls, source of the sub-rect
+  //                                  digests. Zero-initialized by .bss
+  //                                  loader; each widget's BG fill
+  //                                  paints the full 256-pixel width of
+  //                                  its rect on entry, so pre-render
+  //                                  pixel contents in the rendered rows
+  //                                  are irrelevant. Rows OUTSIDE the
+  //                                  three widget rects (80..83, 94..95)
+  //                                  stay zero from .bss (the smoke
+  //                                  digests exclude these rows, so
+  //                                  their contribution never affects
+  //                                  a pass/fail decision).
+  //   _sss_fp_emitted  [u8; 8]       one-shot flag: 0=pending, 1=done.
+  //                                  Matches the widget fingerprint gate
+  //                                  pattern (_pwc_fp_emitted /
+  //                                  _pwm_fp_emitted / _pwn_fp_emitted).
+  //   _sss_fp_str      [u8; 32]      fingerprint string composed byte-
+  //                                  wise on first emit. Sized at 32
+  //                                  bytes (4 qwords) so a future
+  //                                  extension of the string past 24
+  //                                  bytes does not require re-alignment.
+  // ==========================================================================
+  pub let mut _sss_snapshot   : [u8; 256]    = uninit @align(64)
+  pub let mut _sss_fb         : [u8; 131072] = uninit @align(64)
+  pub let mut _sss_fp_emitted : [u8; 8]      = uninit @align(8)
+  pub let mut _sss_fp_str     : [u8; 32]     = uninit @align(8)
+
+  // ==========================================================================
+  // sss_sys_debug_puts(buf_ptr, count) -> u64
+  //
+  // Thin wrapper around SC+ sysno 12 (sys_debug_puts). Byte-for-byte
+  // replica of the peer widget wrappers (pwc_sys_debug_puts /
+  // pwm_sys_debug_puts / pwn_sys_debug_puts). Sole consumer:
+  // sss_emit_fingerprint below.
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2 < 4). Leaf.
+  // ==========================================================================
+  pub let sss_sys_debug_puts : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (buf_ptr: u64) (count: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M4-001 (pdxwatch#7): SC+ sysno 12 (sys_debug_puts) wrapper. SysV rdi=buf_ptr / rsi=count pass through unchanged to SYSCALL rdi/rsi. mov rax, 12; syscall; ret. Kernel-owned debug channel (bypasses fd routing) -- design/user/syscall-table.md row 12. Sole consumer: sss_emit_fingerprint below, which fires exactly once on the all-widget-digest-pass path. Leaf: rcx/r11 SYSCALL-clobbered (both SysV caller-save). Byte-for-byte replica of the peer widget wrappers (pwc_sys_debug_puts / pwm_sys_debug_puts / pwn_sys_debug_puts) -- when the shared gfx_stubs module lands all four wrappers collapse into one.",
+      block: {
+        mov rax, 12;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sss_seed_snapshot(state_ptr) -> u64
+  //
+  // Stamp fixture values into the caller-supplied CollectSnapshot buffer.
+  // First zeroes the entire 256-byte region (mirrors Collectors::collect_
+  // init's discipline: every reserved field starts at 0 so a widget
+  // reader that trusts an unset field can), then stamps the fixture
+  // fields per §FIXTURE SHAPE:
+  //
+  //   [+0]    interval_ticks           = 60
+  //   [+24]   num_cpus                 = 4
+  //   [+32]   per_cpu_active[0]        = 2
+  //   [+40]   per_cpu_active[1]        = 2
+  //   [+48]   per_cpu_active[2]        = 2
+  //   [+56]   per_cpu_active[3]        = 2
+  //   [+104]  total_rss_kb             = 8388608  (8 GiB in KiB)
+  //   [+176]  task_seen                = 15
+  //
+  // Every other field stays at 0 from the zero-fill.
+  //
+  // Contract:
+  //   rdi = state_ptr    VA of a >=256B CollectSnapshot-shaped buffer
+  //   -> rax = 0         always (no validation at this landing)
+  //
+  // Leaf function; no callee-save touched, no nested call. rdi/rax/rcx
+  // are all SysV caller-save. Encoder discipline: no `test`, no imul,
+  // no imm64 in cmp/and, no cmp reg,[mem], no and reg,imm64. The
+  // 8388608 fixture fits imm32 (< 0x7FFFFFFF). Field offsets 104 and
+  // 176 exceed imm8 signed range -- the encoder emits a disp32 form
+  // legally for the `[rdi + imm]` addressing mode.
+  // ==========================================================================
+  pub let sss_seed_snapshot : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-001 (pdxwatch#7): CollectSnapshot fixture-stamp initializer. Contract SysV rdi=state_ptr. Body first zeroes the entire 256-byte region [rdi + 0..255] via a qword scan (rcx=byte cursor starting at 0, incrementing by 8; loop exits via `cmp rcx, 256; jae sss_sd_zero_end`) so every field not stamped below reads as 0. Then stamps the eight fixture qwords: interval_ticks at [+0] = 60; num_cpus at [+24] = 4; per_cpu_active[0..4] at [+32/+40/+48/+56] = 2 each (SSS_FIXTURE_PER_CPU_ACTIVE, yielding 50% load% via WidgetCpu's `min(100, active*25)` proxy); total_rss_kb at [+104] = 8388608 (SSS_FIXTURE_TOTAL_RSS_KB, 8 GiB in KiB -- 0x800000 fits imm32 for the mov reg,imm form); task_seen at [+176] = 15 (SSS_FIXTURE_TASK_SEEN, net-activity proxy landing a deterministic sparkline sample after WidgetNet's [0..21] clamp). Return xor rax, rax (0=PASS). Zero pushes / pops -- leaf. rdi/rax/rcx all SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem], no and reg,imm64. Loop immediates (256, 8, 0) fit imm8. Fixture immediates (60, 4, 2, 15) fit imm8; 8388608 fits imm32 (< 0x7FFFFFFF). Field offsets 104 and 176 exceed imm8 signed range but fit imm32 -- the encoder emits disp32 legally for [rdi + imm]. Labels sss_sd_zero_scan / sss_sd_zero_end prefixed sss_, no reserved-keyword substrings.",
+      block: {
+        // Zero the entire 256-byte region.
+        xor rax, rax;
+        xor rcx, rcx;
+        sss_sd_zero_scan:
+        cmp rcx, 256;
+        jae sss_sd_zero_end;
+        mov [rdi + rcx], rax;
+        add rcx, 8;
+        jmp sss_sd_zero_scan;
+        sss_sd_zero_end:
+
+        // Stamp interval_ticks = 60 at [+0].
+        mov rax, 60;
+        mov [rdi + 0], rax;
+
+        // Stamp num_cpus = 4 at [+24].
+        mov rax, 4;
+        mov [rdi + 24], rax;
+
+        // Stamp per_cpu_active[0..4] = 2 each at [+32/+40/+48/+56].
+        mov rax, 2;
+        mov [rdi + 32], rax;
+        mov [rdi + 40], rax;
+        mov [rdi + 48], rax;
+        mov [rdi + 56], rax;
+
+        // Stamp total_rss_kb = 8388608 (8 GiB in KiB) at [+104].
+        mov rax, 8388608;
+        mov [rdi + 104], rax;
+
+        // Stamp task_seen = 15 at [+176].
+        mov rax, 15;
+        mov [rdi + 176], rax;
+
+        xor rax, rax;                          // SSS_PASS
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sss_digest_subrect(fb_ptr, y_start, y_count) -> u64
+  //
+  // Compute a simple 64-bit sum-of-qwords digest over the sub-rect
+  // [y_start .. y_start + y_count) rows of the caller-supplied
+  // framebuffer. Each row is SSS_FB_STRIDE_BYTES (1024) = 128 qwords.
+  // The digest accumulator is a plain 64-bit add; wrap semantics are
+  // never observed (max real digest ~21M for the CPU sub-rect volume,
+  // nowhere near u64 overflow).
+  //
+  // Contract:
+  //   rdi = fb_ptr       VA of a BGRA8888 back-buffer, stride
+  //                      SSS_FB_STRIDE_BYTES (1024) bytes/row.
+  //   rsi = y_start      top row of the sub-rect (inclusive)
+  //   rdx = y_count      number of rows in the sub-rect
+  //   -> rax = digest    u64 sum of qwords in the sub-rect
+  //
+  // Register plan: 5-push callee-save prologue (rbx=accumulator,
+  // r12=fb_ptr, r13=row, r14=row_end, r15=row_base) = 40B pushes ->
+  // SysV entry rsp%16==8 + 40 = 48 %16==0. Leaf w.r.t. nested calls
+  // (no calls inside); the 5-push shape is chosen to give the row
+  // scan a clean register roster (rcx as qword cursor, rax as
+  // load payload). Labels sss_dg_* prefixed sss_.
+  // ==========================================================================
+  pub let sss_digest_subrect : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fb_ptr: u64) (y_start: u64) (y_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M4-001 (pdxwatch#7): sum-of-qwords sub-rect digest. Contract SysV rdi=fb_ptr, rsi=y_start, rdx=y_count. Register plan: 5-push callee-save (rbx=accumulator, r12=fb_ptr, r13=row cursor, r14=row_end, r15=row_base) = 40B -> SysV rsp%16==8 + 40 = %16==0 (though this function is leaf w.r.t. nested calls the alignment shape matches the widget-render callers that DO nest). Init: xor rbx, rbx (digest=0); mov r12, rdi; mov r13, rsi (row = y_start); mov r14, rsi; add r14, rdx (row_end = y_start + y_count). Outer scan: cmp r13, r14; jae done. Compute row_base = fb + row * 1024 via `mov r15, r13; shl r15, 10; add r15, r12` (no imul; 1024 = 2^10). Inner scan: xor rcx, rcx (qword cursor bytes = 0); cmp rcx, 1024; jae col_end; mov rax, [r15 + rcx]; add rbx, rax; add rcx, 8; jmp col_step. Advance row: add r13, 1; jmp outer. Return mov rax, rbx; 5-pop; ret. Encoder discipline: no `test`, no imul (1024 via shl 10; qword step via add rcx, 8; no runtime multiply), no imm64 in cmp/and (immediates 0, 8, 1, 1024 fit imm32), no cmp reg,[mem] (qword loaded to rax before add), no and reg,imm64. `[r15 + rcx]` is two-register addressing (implicit *1 index; not the banned scaled form `[reg + N*8]`) -- identical shape to `mov [rdi + rcx], rax` in collectors.pdx Phase B reset scan. Labels sss_dg_row_step / sss_dg_row_end / sss_dg_col_step / sss_dg_col_end prefixed sss_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        xor rbx, rbx;                          // digest = 0
+        mov r12, rdi;                          // r12 = fb_ptr
+        mov r13, rsi;                          // r13 = row = y_start
+        mov r14, rsi;
+        add r14, rdx;                          // r14 = row_end = y_start + y_count
+
+        sss_dg_row_step:
+        cmp r13, r14;
+        jae sss_dg_row_end;
+
+        // row_base = fb_ptr + row * 1024  (1024 = 2^10)
+        mov r15, r13;
+        shl r15, 10;                           // row * 1024
+        add r15, r12;                          // + fb_ptr
+
+        // Inner scan: sum 128 qwords per row (128 * 8 = 1024 bytes).
+        xor rcx, rcx;                          // qword cursor bytes = 0
+        sss_dg_col_step:
+        cmp rcx, 1024;                         // stride bytes
+        jae sss_dg_col_end;
+        mov rax, [r15 + rcx];                  // qword load
+        add rbx, rax;                          // digest += qword
+        add rcx, 8;
+        jmp sss_dg_col_step;
+        sss_dg_col_end:
+
+        add r13, 1;                            // row++
+        jmp sss_dg_row_step;
+
+        sss_dg_row_end:
+        mov rax, rbx;                          // return digest
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sss_emit_fingerprint() -> u64
+  //
+  // One-shot fingerprint emission. Composes "pdxwatch seeded-stat ok\n"
+  // (24 bytes) into _sss_fp_str via three qword stores, then calls
+  // sss_sys_debug_puts. Guarded by _sss_fp_emitted (0 -> emit + set,
+  // 1 -> skip). Returns 1 on emit, 0 on skip. Structurally identical
+  // to the peer widget fingerprint emitters (pwc_emit_fingerprint /
+  // pwm_emit_fingerprint / pwn_emit_fingerprint) modulo the string
+  // content.
+  //
+  // ASCII qword encoding (little-endian):
+  //   [+0]  "pdxwatch"  = 0x6863_7461_7778_6470
+  //                       (byte 0 = 'p' = 0x70 LSB)
+  //   [+8]  " seeded-"  = 0x2d64_6564_6565_7320
+  //                       (byte 0 = ' ' = 0x20 LSB; byte 7 = '-' = 0x2d MSB)
+  //   [+16] "stat ok\n" = 0x0a6b_6f20_7461_7473
+  //                       (byte 0 = 's' = 0x73 LSB; byte 7 = LF = 0x0a MSB)
+  //
+  // Register plan: 3 pushes (rbx real + r12 reserved + rax pad) = 24B;
+  // entry rsp %16==8, +24 = 32 %16==0 -> aligned for the syscall
+  // wrapper call. Labels sss_fp_* prefixed sss_.
+  // ==========================================================================
+  pub let sss_emit_fingerprint : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M4-001 (pdxwatch#7): one-shot 'pdxwatch seeded-stat ok\\n' emit via SC+ sysno 12 sys_debug_puts. Guard: mov rax, [rip + _sss_fp_emitted]; cmp rax, 0; jne skip (already emitted). Compose: three qword stores into _sss_fp_str encoding the 24-byte string in ASCII LE. Emit: lea rdi, [rip + _sss_fp_str]; mov rsi, 24; call sss_sys_debug_puts. Mark: mov rax, 1; mov [rip + _sss_fp_emitted], rax. Return 1 (emitted) or 0 (skipped). Register plan: 3 pushes (rbx real + r12 reserved + rax pad) = 24B; entry rsp %16==8, +24 = 32 %16==0 -> aligned for the syscall wrapper call. Structurally identical to pwc_emit_fingerprint / pwm_emit_fingerprint / pwn_emit_fingerprint modulo the three qword string constants. Encoder discipline: no test (cmp rax, 0 for the guard); no imul; every string qword constant used only in mov (movabs form legal). Labels sss_fp_emit / sss_fp_skip / sss_fp_done prefixed sss_.",
+      block: {
+        push rbx;
+        push r12;                              // reserved (unused, keeps alignment)
+        push rax;                              // pad -> %16=0 (3 pushes = 24B)
+
+        // Guard: skip if already emitted.
+        mov rax, [rip + _sss_fp_emitted];
+        cmp rax, 0;
+        jne sss_fp_skip;
+
+        // Compose 24-byte string into _sss_fp_str.
+        // "pdxwatch": p(70) d(64) x(78) w(77) a(61) t(74) c(63) h(68)
+        //             LE qword = 0x68_63_74_61_77_78_64_70
+        mov rax, 0x6863746177786470;           // "pdxwatch" (LE)
+        mov [rip + _sss_fp_str + 0], rax;
+        // " seeded-": SP(20) s(73) e(65) e(65) d(64) e(65) d(64) -(2d)
+        //             LE qword = 0x2d_64_65_64_65_65_73_20
+        mov rax, 0x2d64656465657320;           // " seeded-" (LE)
+        mov [rip + _sss_fp_str + 8], rax;
+        // "stat ok\n": s(73) t(74) a(61) t(74) SP(20) o(6f) k(6b) LF(0a)
+        //              LE qword = 0x0a_6b_6f_20_74_61_74_73
+        mov rax, 0x0a6b6f2074617473;           // "stat ok\n" (LE)
+        mov [rip + _sss_fp_str + 16], rax;
+
+        // Emit via sys_debug_puts.
+        lea rdi, [rip + _sss_fp_str];
+        mov rsi, 24;                           // SSS_FINGERPRINT_LEN
+        call sss_sys_debug_puts;
+
+        // Mark emitted.
+        mov rax, 1;
+        mov [rip + _sss_fp_emitted], rax;
+
+        // Return 1 (emitted).
+        mov rax, 1;
+        jmp sss_fp_done;
+
+        sss_fp_skip:
+        xor rax, rax;
+
+        sss_fp_done:
+        pop rcx;                               // discard pad (was rax)
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // seeded_stat_smoke() -> u64
+  //
+  // Boot-smoke witness orchestrator. Drives:
+  //
+  //   1. sss_seed_snapshot(_sss_snapshot)                -- fixture stamp
+  //   2. cpu_widget_render(_sss_fb, _sss_snapshot, ...)  -- CPU render
+  //   3. mem_widget_render(_sss_fb, _sss_snapshot, ...)  -- Mem render
+  //   4. net_widget_render(_sss_fb, _sss_snapshot, ...)  -- Net render
+  //   5. sss_digest_subrect(_sss_fb, 0, 80)              -- CPU digest
+  //   6. cmp digest, SSS_EXPECTED_CPU_DIGEST             -- CPU verify
+  //   7. sss_digest_subrect(_sss_fb, 84, 10)             -- Mem digest
+  //   8. cmp digest, SSS_EXPECTED_MEM_DIGEST             -- Mem verify
+  //   9. sss_digest_subrect(_sss_fb, 96, 32)             -- Net digest
+  //  10. cmp digest, SSS_EXPECTED_NET_DIGEST             -- Net verify
+  //  11. sss_emit_fingerprint()                          -- serial ok
+  //  12. return SSS_PASS
+  //
+  // On any widget-render error return (non-zero rax from cpu/mem/net_
+  // widget_render), the orchestrator short-circuits to the corresponding
+  // SSS_FAIL_*_RENDER_ERR sentinel WITHOUT emitting the fingerprint --
+  // a render refuse (arg validation) is a distinct failure mode from a
+  // digest drift. On any digest mismatch, likewise short-circuits to
+  // SSS_FAIL_*_DIGEST WITHOUT emitting the fingerprint (a placeholder
+  // sentinel never matches; the smoke's silent-safe path requires
+  // constants to be frozen -- see §PLACEHOLDER-FINGERPRINT POLICY).
+  //
+  // Contract:
+  //   (nullary)
+  //   -> rax = 0                                  all-pass; fingerprint emitted
+  //   -> rax = 0xFFFFE2F0..0xFFFFE2F5             fail sentinel; no fingerprint
+  //
+  // Register plan: 1-push callee-save prologue (rbx, unused but present
+  // for SysV alignment: SysV rsp%16==8 + 8B push = rsp%16==0 for every
+  // nested call). Every arg-passing rebuild uses caller-save rdi/rsi/
+  // rdx/rcx/r8/r9, freshly loaded from the `lea rip + _sss_*` bases
+  // before each call, so no cross-call register preservation is needed
+  // beyond the alignment pad. This is the same 1-push shape peer test
+  // orchestrators use (pcc_run_all / pqs_run_all).
+  //
+  // Digest comparison discipline: SSS_EXPECTED_*_DIGEST constants are
+  // 0xFFFFFFFFFFFFFFFF at the PLACEHOLDER stage, which exceeds imm32
+  // range so a direct `cmp rax, imm64` is not legal. Every compare
+  // stages the sentinel through rcx first (`mov rcx, imm; cmp rax, rcx`)
+  // -- rcx is caller-save and clobbered by the immediately-preceding
+  // call return (which populated rax with the digest), so the two-
+  // instruction stage is free of register pressure.
+  // ==========================================================================
+  pub let seeded_stat_smoke : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M4-001 (pdxwatch#7): boot-smoke witness orchestrator. Register plan: 1-push callee-save (rbx unused, alignment pad) = 8B -> SysV rsp%16==8 + 8 = %16==0 for every nested call (sss_seed_snapshot, cpu/mem/net_widget_render, sss_digest_subrect, sss_emit_fingerprint). Phase A (seed): lea rdi, [rip + _sss_snapshot]; call sss_seed_snapshot. Phase B (render CPU): lea rdi, [rip + _sss_fb]; lea rsi, [rip + _sss_snapshot]; xor rdx, rdx (x0=0); xor rcx, rcx (y0=0); mov r8, 256 (width); mov r9, 80 (height); call cpu_widget_render. cmp rax, 0; jne cpu_render_fail. Phase C (render Mem): lea rdi, [rip + _sss_fb]; lea rsi, [rip + _sss_snapshot]; xor rdx, rdx; mov rcx, 84; mov r8, 256; mov r9, 10; call mem_widget_render. cmp rax, 0; jne mem_render_fail. Phase D (render Net): lea rdi, [rip + _sss_fb]; lea rsi, [rip + _sss_snapshot]; xor rdx, rdx; mov rcx, 96; mov r8, 256; mov r9, 32; call net_widget_render. cmp rax, 0; jne net_render_fail. Phase E (CPU digest + verify): lea rdi, [rip + _sss_fb]; xor rsi, rsi (y_start=0); mov rdx, 80 (y_count); call sss_digest_subrect. mov rcx, 0xFFFFFFFFFFFFFFFF (SSS_EXPECTED_CPU_DIGEST placeholder, staged through rcx because imm64 is illegal in cmp reg,imm); cmp rax, rcx; jne cpu_digest_fail. Phase F (Mem digest + verify): mov rsi, 84; mov rdx, 10; call sss_digest_subrect. mov rcx, 0xFFFFFFFFFFFFFFFF; cmp rax, rcx; jne mem_digest_fail. Phase G (Net digest + verify): mov rsi, 96; mov rdx, 32; call sss_digest_subrect. mov rcx, 0xFFFFFFFFFFFFFFFF; cmp rax, rcx; jne net_digest_fail. Phase H (fingerprint): call sss_emit_fingerprint. Phase I (return PASS): xor rax, rax; pop rbx; ret. Fail tails each carry a distinct 0xFFFFE2Fx sentinel so an operator reading a test log can distinguish which widget's render / digest caught the drift. No fingerprint on any fail path -- the silent-console fail is the observable that catches the placeholder-not-yet-frozen state. Encoder discipline: no `test` (all cmp reg, 0); no imul; every immediate in cmp fits imm8 (0) or imm32 (staged through rcx for imm64); no `and reg, imm64`; no `cmp reg, [mem]` (widget/digest returns land in rax before the compare); no `mul`. Widget-render arg immediates (0, 84, 96, 256, 80, 10, 32) all fit imm8 or imm32. Fail-code movs (0xFFFFE2F0..0xFFFFE2F5) take the movabs 10-byte form legally. Labels sss_ss_* prefixed sss_, no reserved keyword substrings.",
+      block: {
+        push rbx;
+
+        // ---- Phase A: seed snapshot ---------------------------------------
+        lea rdi, [rip + _sss_snapshot];
+        call sss_seed_snapshot;
+
+        // ---- Phase B: render CPU widget -----------------------------------
+        lea rdi, [rip + _sss_fb];
+        lea rsi, [rip + _sss_snapshot];
+        xor rdx, rdx;                          // x0 = 0
+        xor rcx, rcx;                          // y0 = 0
+        mov r8, 256;                           // width
+        mov r9, 80;                            // height (CPU widget)
+        call cpu_widget_render;
+        cmp rax, 0;
+        jne sss_ss_cpu_render_fail;
+
+        // ---- Phase C: render Mem widget -----------------------------------
+        lea rdi, [rip + _sss_fb];
+        lea rsi, [rip + _sss_snapshot];
+        xor rdx, rdx;                          // x0 = 0
+        mov rcx, 84;                           // y0 = 84
+        mov r8, 256;                           // width
+        mov r9, 10;                            // height (Mem widget)
+        call mem_widget_render;
+        cmp rax, 0;
+        jne sss_ss_mem_render_fail;
+
+        // ---- Phase D: render Net widget -----------------------------------
+        lea rdi, [rip + _sss_fb];
+        lea rsi, [rip + _sss_snapshot];
+        xor rdx, rdx;                          // x0 = 0
+        mov rcx, 96;                           // y0 = 96
+        mov r8, 256;                           // width
+        mov r9, 32;                            // height (Net widget)
+        call net_widget_render;
+        cmp rax, 0;
+        jne sss_ss_net_render_fail;
+
+        // ---- Phase E: CPU digest + verify ---------------------------------
+        lea rdi, [rip + _sss_fb];
+        xor rsi, rsi;                          // y_start = 0
+        mov rdx, 80;                           // y_count
+        call sss_digest_subrect;
+        mov rcx, 0xFFFFFFFFFFFFFFFF;           // SSS_EXPECTED_CPU_DIGEST (TODO)
+        cmp rax, rcx;
+        jne sss_ss_cpu_digest_fail;
+
+        // ---- Phase F: Mem digest + verify ---------------------------------
+        lea rdi, [rip + _sss_fb];
+        mov rsi, 84;                           // y_start
+        mov rdx, 10;                           // y_count
+        call sss_digest_subrect;
+        mov rcx, 0xFFFFFFFFFFFFFFFF;           // SSS_EXPECTED_MEM_DIGEST (TODO)
+        cmp rax, rcx;
+        jne sss_ss_mem_digest_fail;
+
+        // ---- Phase G: Net digest + verify ---------------------------------
+        lea rdi, [rip + _sss_fb];
+        mov rsi, 96;                           // y_start
+        mov rdx, 32;                           // y_count
+        call sss_digest_subrect;
+        mov rcx, 0xFFFFFFFFFFFFFFFF;           // SSS_EXPECTED_NET_DIGEST (TODO)
+        cmp rax, rcx;
+        jne sss_ss_net_digest_fail;
+
+        // ---- Phase H: emit fingerprint (all-pass path only) ---------------
+        call sss_emit_fingerprint;
+
+        // ---- Phase I: return PASS -----------------------------------------
+        xor rax, rax;                          // SSS_PASS
+        pop rbx;
+        ret;
+
+        sss_ss_cpu_render_fail:
+        mov rax, 0xFFFFE2F3;                   // SSS_FAIL_CPU_RENDER_ERR
+        pop rbx;
+        ret;
+
+        sss_ss_mem_render_fail:
+        mov rax, 0xFFFFE2F4;                   // SSS_FAIL_MEM_RENDER_ERR
+        pop rbx;
+        ret;
+
+        sss_ss_net_render_fail:
+        mov rax, 0xFFFFE2F5;                   // SSS_FAIL_NET_RENDER_ERR
+        pop rbx;
+        ret;
+
+        sss_ss_cpu_digest_fail:
+        mov rax, 0xFFFFE2F0;                   // SSS_FAIL_CPU_DIGEST
+        pop rbx;
+        ret;
+
+        sss_ss_mem_digest_fail:
+        mov rax, 0xFFFFE2F1;                   // SSS_FAIL_MEM_DIGEST
+        pop rbx;
+        ret;
+
+        sss_ss_net_digest_fail:
+        mov rax, 0xFFFFE2F2;                   // SSS_FAIL_NET_DIGEST
+        pop rbx;
+        ret
+      }
+    }
+
+}

@@ -93,6 +93,32 @@ deps:
 #   click-cycle state (pdxwatch#8)   0xFFFFE2C0..0xFFFFE2CB   (M4-002)
 #   'q'-quit state (pdxwatch#9)      0xFFFFE2D0..0xFFFFE2DB   (M4-003)
 tests:
+  - tests/test_seeded_stat_smoke.pdx   # M4-001 (pdxwatch#7): seeded-stat
+                                       # render smoke -- bypasses real
+                                       # sys_taskinfo aggregation, writes
+                                       # fixture values (4 CPUs @ 50%, 8 GB
+                                       # used, task_seen=15 net-activity
+                                       # proxy) directly into a private
+                                       # CollectSnapshot .bss slot, drives
+                                       # cpu/mem/net_widget_render against
+                                       # a private 256x128 BGRA back-buffer,
+                                       # computes per-widget sum-of-qwords
+                                       # digests over CPU rows [0..79],
+                                       # mem rows [84..93], net rows
+                                       # [96..127], compares to hardcoded
+                                       # expected values, emits 'pdxwatch
+                                       # seeded-stat ok' fingerprint via
+                                       # SC+ sysno 12 sys_debug_puts on
+                                       # all-pass. Fail-code band
+                                       # 0xFFFFE2F0..0xFFFFE2F5 per the
+                                       # M4-001 reservation above.
+                                       # Expected-digest constants are
+                                       # PLACEHOLDERS (0xFFFFFFFFFFFFFFFF)
+                                       # that ALWAYS fail on the first run
+                                       # -- see §PLACEHOLDER-FINGERPRINT
+                                       # POLICY in the source file for
+                                       # the freeze-after-first-green
+                                       # procedure.
   - tests/test_click_cycle_smoke.pdx   # M4-002 (pdxwatch#8): click-cycle
                                        # encoder-half smoke -- state machine
                                        # + scripted-click witness. Lands
@@ -130,8 +156,11 @@ tests:
                                        # fingerprint. Fail-code band
                                        # 0xFFFFE2D0..0xFFFFE2DB (adjacent
                                        # to #8's 0xFFFFE2C0..CB).
-  # (M4-001 seeded-stat smoke lands as tests/test_seeded_stat_smoke.pdx
-  # once the KIND_SYS_STAT seeding primitive lands cross-repo)
+  # (M4-001 seeded-stat smoke LANDED as tests/test_seeded_stat_smoke.pdx
+  # above; the "KIND_SYS_STAT seeding primitive" prerequisite noted in
+  # the forward-declaration was resolved by bypassing the syscall path
+  # entirely -- the smoke writes fixture values directly into a private
+  # CollectSnapshot .bss slot, dodging the cross-repo dependency.)
 
 # --- Documentation targets ---------------------------------------------
 # .pdxdoc file(s) shipped at M5 packaging time.
