@@ -137,6 +137,10 @@ syscalls:
 - sys_taskinfo      @ 83
 - sys_semantic_send @ 115
 - sys_debug_puts    @ 12   # M2-001 (pdxwatch#3): WidgetCpu fingerprint emit
+                           # M2-002 (pdxwatch#4): WidgetMem fingerprint emit
+                           #                       (shares the same sysno,
+                           #                        no new caps.decl entry
+                           #                        needed)
 
 # ---------------------------------------------------------------------
 # Declared output schemas

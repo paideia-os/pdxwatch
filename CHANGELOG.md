@@ -9,6 +9,76 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ### Added
 
+- **v1.2-B -- M2-002 memory tri-color widget** (pdxwatch#4).
+  - `src/widget_mem.pdx` (new, `module WidgetMem`): tri-color memory
+    bar render widget. Reads `CollectSnapshot.total_rss_kb` (offset
+    +104, already populated by Collectors::collect_tick) and
+    `CollectSnapshot.task_seen` (offset +176) and renders one
+    horizontal bar with three subrects (used / cached / free) into
+    a caller-supplied BGRA8888 framebuffer. Segment widths scale
+    from KiB to pixels via a single `shr reg, 11` (2048 KiB per
+    pixel; encoder-safe, no imul, no div). Labels drawn as a
+    9-glyph strip via `pwm_gfx_draw_glyph`. Fingerprint
+    `pdxwatch mem-widget ok\n` emitted once on first successful
+    render via SC+ sysno 12 (`sys_debug_puts`).
+  - Entry point: `WidgetMem::mem_widget_render(fb_ptr, snap_ptr,
+    x0, y0, width, height) -> u64`. Extended-arity vs the
+    R102.M2-002 issue's 5-arg shape: `snap_ptr` is passed
+    explicitly for the same M1-era reason WidgetCpu's entry point
+    uses. Both signatures narrow back to 5 args together when
+    M1-002 introduces a widget-registry global.
+  - Memory-stat source (M1-era proxy; no `sys_meminfo` on paideia-
+    os HEAD -- verified via grep against `design/user/syscall-
+    table.md` and `src/kernel/`):
+      - `used_kb = total_rss_kb`  (Collectors' RSS aggregate --
+        the field the CollectSnapshot layout comment explicitly
+        reserved "for the M2 memory tri-color widget").
+      - `cached_kb = task_seen << 4`  (proxy: 16 KiB "cached"
+        per live task; bounded because `task_seen <= 64` so
+        `cached_kb <= 1024`. Retires when a real page-cache
+        counter lands via sys_meminfo / KIND_PMM-invoke).
+      - `free_kb = PWM_MEM_TOTAL_KB - used_kb - cached_kb`
+        (assumed 256 MiB pool matches QEMU `-m 256`; swapped
+        for a live sys_meminfo read when that syscall lands).
+    `_pwm_prior_total_rss_kb` scratch reserved for the sys_meminfo
+    landing's memory-pressure delta computation; unused at M2-002.
+  - Color scheme (monochromatic dark-to-light BLUE ramp, distinct
+    from WidgetCpu's warning gradient so users parse the mem bar
+    as one quantity subdivided into three parts, not three
+    independent alerts):
+      - `PWM_COLOR_USED   = 0xFFB03018`  dark ocean blue
+      - `PWM_COLOR_CACHED = 0xFFD07040`  medium blue
+      - `PWM_COLOR_FREE   = 0xFFE0B080`  light sky blue
+      - `PWM_COLOR_BG` and `PWM_COLOR_LABEL` match WidgetCpu.
+  - **Inline libpdx-gfx / libpdx-font stubs** (`pwm_gfx_fill_rect`,
+    `pwm_gfx_draw_glyph`): byte-for-byte replicas of WidgetCpu's
+    `pwc_gfx_*` stubs, prefixed `pwm_*` so a future wire-up round
+    does not collide on link. Retired together when
+    libpdx-gfx.M2-002 (`gfx_fill_rect`) and libpdx-font.M2-001
+    (`gfx_draw_glyph`) land. The follow-up dependency issue
+    ("pdxwatch: retire widget_cpu.pdx / widget_mem.pdx libpdx-gfx
+    + libpdx-font stubs when M2-002 / M2-001 land") covers both
+    widgets together.
+  - Error-band claim extended: `0xFFFFE220..0xFFFFE22F` (widget's
+    fault surface: `PWM_ERR_BAD_FB_PTR`, `PWM_ERR_BAD_SNAP_PTR`,
+    `PWM_ERR_RECT_TOO_SMALL`); WidgetCpu's
+    `0xFFFFE210..0xFFFFE21F` and Collectors' `0xFFFFE200..0xFFFFE20F`
+    holdings unchanged.
+  - `src/main.pdx`: the bounded-iterate loop now calls
+    `mem_widget_render` right after `cpu_widget_render` on every
+    refresh return of 1. CPU widget shrinks from height=96 to
+    height=80 (its actual 8-CPU * 10-px row footprint) and the
+    memory widget takes the remaining rows at (x0=0, y0=84,
+    w=256, h=10) inside the same `_pw_fb` back-buffer -- rows
+    80..83 stay as background gap between the two widgets. No
+    `_pw_fb` resize needed.
+  - `caps.decl`: `sys_debug_puts @ 12` note extended to record
+    the WidgetMem fingerprint emitter shares the syscall (no
+    new entry needed; kernel dispatch is idempotent).
+  - `manifest.pdxproj`: `sources:` block promotes
+    `src/widget_mem.pdx` from commented forward-declaration to
+    live entry.
+
 - **v1.2-A -- M2-001 CPU bar-per-core widget** (pdxwatch#3).
   - `src/widget_cpu.pdx` (new, `module WidgetCpu`): per-online-CPU
     load-bar render widget. Reads `CollectSnapshot.num_cpus` +
@@ -70,7 +140,10 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
   the serial console for this string to gate M2-001 "widget wired
   and firing" verification. Emission is one-shot per process
   lifetime (`_pwc_fp_emitted` flag) so the 1Hz refresh loop does
-  not spam the console.
+  not spam the console. The v1.2-B `pdxwatch mem-widget ok`
+  fingerprint uses the identical shape (one-shot via
+  `_pwm_fp_emitted`), so a boot smoke can grep both strings to
+  gate the two M2 landings independently.
 - `WidgetCpu::PWC_FB_STRIDE_BYTES = 1024` is hard-coded to match
   the `_pw_fb` stub's row pitch. When gfx_surface_open lands and
   SurfaceHandle carries stride, `cpu_widget_render` gains a

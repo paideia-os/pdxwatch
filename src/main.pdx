@@ -1,6 +1,7 @@
 // src/main.pdx -- pdxwatch.M1-001 (paideia-os/pdxwatch#1)
 //                -- v1.1-A real-body landing (pdxwatch#11)
 //                -- v1.2-A CPU-widget wire-in (pdxwatch#3)
+//                -- v1.2-B mem-widget wire-in (pdxwatch#4)
 //
 // Main::main entry point + fixed-cadence dispatch loop skeleton.
 //
@@ -142,8 +143,12 @@ module Main = structure {
   //
   // Dimensions were chosen to match WidgetCpu's PWC_FB_STRIDE_BYTES
   // = 1024 (== 256 * 4) constant. Height = 96 fits 8 CPU rows at
-  // PWC_BAR_ROW_PITCH = 10 px + top margin. Any resize churns both
-  // this allocation and WidgetCpu's stride constant in one pass.
+  // PWC_BAR_ROW_PITCH = 10 px + top margin. v1.2-B (pdxwatch#4)
+  // reuses the same _pw_fb for the memory tri-color widget stacked
+  // below the CPU rows: rows 0..79 = 8 CPU rows, rows 80..83 = gap,
+  // rows 84..95 = memory bar (10 px allocation, 8-px bar + margin).
+  // Any resize churns both this allocation and WidgetCpu/WidgetMem's
+  // stride constants in one pass.
   // ==========================================================================
   pub let mut _pw_fb : [u8; 98304] = uninit @align(64)
 
@@ -257,8 +262,31 @@ module Main = structure {
         xor rdx, rdx;                              // x0 = 0
         xor rcx, rcx;                              // y0 = 0
         mov r8, 256;                               // width
-        mov r9, 96;                                // height
+        mov r9, 80;                                // height  (CPU widget:
+                                                   //  8 CPUs * PWC_BAR_ROW_PITCH
+                                                   //  = 80 px; leaves rows
+                                                   //  80..95 for the mem
+                                                   //  widget below)
         call cpu_widget_render;
+        // v1.2-B (pdxwatch#4): mem tri-color widget below the CPU stack.
+        // Placed at (x0=0, y0=84, w=256, h=10) inside the same _pw_fb
+        // stub back-buffer. The 4-px vertical gap (rows 80..83) is
+        // widget-rect background paint from the fill(bg) both widgets
+        // do first; visually separates the CPU rows from the mem bar
+        // without an explicit divider draw. Args:
+        //   rdi = _pw_fb          (256x96 BGRA stub back-buffer)
+        //   rsi = _pw_snapshot    (populated by collect_tick)
+        //   rdx = 0               (x0 = left edge)
+        //   rcx = 84              (y0; leaves rows 80..83 as visual gap)
+        //   r8  = 256             (widget width)
+        //   r9  = 10              (widget height; 8-px bar + 2-px margin)
+        lea rdi, [rip + _pw_fb];                   // fb_ptr
+        mov rsi, r12;                              // snap_ptr
+        xor rdx, rdx;                              // x0 = 0
+        mov rcx, 84;                               // y0 = 84
+        mov r8, 256;                               // width
+        mov r9, 10;                                // height
+        call mem_widget_render;
         pw_main_no_render:
         add rbx, 1;
         jmp pw_main_iter_step;

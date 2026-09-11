@@ -1,0 +1,705 @@
+// src/widget_mem.pdx -- pdxwatch.M2-002 (paideia-os/pdxwatch#4)
+//
+// WidgetMem module: memory tri-color bar render widget.
+//
+// =============================================================================
+// SCOPE  (design/graphics/r102-user-plan.md §4.8 R102.M2-002)
+// =============================================================================
+//
+// Reads live memory stats each second (via the CollectSnapshot the
+// Collectors module already populates) and renders one horizontal bar
+// with three colored segments (used / cached / free) scaled to the
+// bar-area width into a caller-supplied BGRA8888 framebuffer.
+// Labels are drawn via a `gfx_draw_glyph`-shaped wrapper. Emits the
+// serial-console fingerprint 'pdxwatch mem-widget ok' once on the
+// first successful render (via SC+ sysno 12 sys_debug_puts).
+//
+// This module mirrors src/widget_cpu.pdx (pdxwatch#3, M2-001) shape
+// exactly: same fingerprint-emit path, same inline libpdx-gfx /
+// libpdx-font stubs, same BGRA store discipline (sized `mov_d`),
+// same 5-push callee-save + local-slot register plan. The
+// tri-color bar shape is the single structural difference from
+// WidgetCpu's per-CPU load-bar shape -- one bar row instead of a
+// per-CPU iterate, three subrects instead of one filled portion.
+//
+// The R102 wave-ordering table names libpdx-gfx.M2-002 (gfx_fill_rect)
+// and libpdx-font.M2-001 (gfx_draw_glyph over the glyph store) as
+// prerequisites; neither library has landed in the pdxwatch link path
+// at this landing time. Rather than block the widget on the two
+// upstream landings, this module ships **minimal inline stubs**
+// prefixed `pwm_gfx_*` (so a future wire-up round does not collide
+// on link with libpdx-gfx's real `gfx_*` symbols). The stubs are
+// byte-for-byte replicas of widget_cpu.pdx's `pwc_gfx_*` stubs --
+// the follow-up dependency issue (see file-level comment in
+// widget_cpu.pdx §STUB) covers both widgets together.
+//
+// =============================================================================
+// MEMORY-STAT SOURCE (M1-era proxy; sys_meminfo pending)
+// =============================================================================
+//
+// The R102.M2-002 issue text names the ideal three-segment shape:
+// used / cached / free memory as absolute KiB values whose sum equals
+// the physical-RAM pool size. Paideia-os HEAD's SC+ layer does NOT
+// surface a sys_meminfo / sys_pmm_stats / KIND_PMM-invoke path;
+// searching `design/user/syscall-table.md` and `src/kernel/` for
+// meminfo / physmem / frame_stats returns no live sysno at HEAD.
+//
+// The widget therefore reads the two aggregate slots the Collectors
+// module already populates each refresh:
+//
+//   used_kb   = CollectSnapshot[+104] = total_rss_kb
+//               (sum of every live task's rss_pages << 2; the
+//                RSS-in-KiB aggregate collectors.pdx §CollectSnapshot
+//                layout explicitly reserved for "the M2 memory tri-
+//                color widget")
+//   cached_kb = CollectSnapshot[+176] << 4 = task_seen * 16 KiB
+//               (M1-era proxy: assumes ~16 KiB of "cached" per live
+//                task -- a page-cache accounting slot does not yet
+//                exist. Bounded by task_seen <= PW_MAX_TASKS = 64,
+//                so cached_kb <= 1024 KiB. When a real page-cache
+//                counter lands (kernel-owned or KIND_PMM-invoke),
+//                this proxy retires without changing the render
+//                shape.)
+//   free_kb   = PWM_MEM_TOTAL_KB - used_kb - cached_kb
+//               (clamped to 0 if used+cached >= total; assumed
+//                pool PWM_MEM_TOTAL_KB = 262144 KiB (256 MiB)
+//                matches QEMU's default -m 256 boot line -- a real
+//                sys_meminfo landing replaces the constant with a
+//                live read).
+//
+// A widget-owned prior-tick scratch region (_pwm_prior_total_rss_kb)
+// is reserved for the sys_meminfo landing's delta-based memory-
+// pressure computation; unused at M2-002.
+//
+// =============================================================================
+// FINGERPRINT (SC+ sysno 12 sys_debug_puts)
+// =============================================================================
+//
+// The R102.M2-002 issue names the observable serial-console fingerprint
+// 'pdxwatch mem-widget ok'. Emitted through sys_debug_puts (sysno 12,
+// kernel-owned debug channel that bypasses normal fd routing -- see
+// design/user/syscall-table.md row 12) on the first successful render
+// call only; a one-shot flag `_pwm_fp_emitted` gates re-emission so
+// the 1Hz refresh loop does not spam the serial console.
+//
+// The 23-byte fingerprint string ("pdxwatch mem-widget ok\n") is
+// laid down at runtime by three qword stores into `_pwm_fp_str` on
+// first-render entry -- identical shape to widget_cpu.pdx's
+// `pwc_emit_fingerprint`. The three qword constants below are LE-
+// packed ASCII (byte 0 = LSB):
+//
+//   [+0]  "pdxwatch"  = 0x6863_7461_7778_6470
+//                       (byte 0 = 'p' = 0x70 LSB)
+//   [+8]  " mem-wid"  = 0x6469_772d_6d65_6d20
+//                       (byte 0 = ' ' = 0x20 LSB)
+//   [+16] "get ok\n\0" = 0x000a_6b6f_2074_6567
+//                       (byte 0 = 'g' = 0x67 LSB)  -- shared shape
+//                       with widget_cpu.pdx's third qword since both
+//                       fingerprints end "...-widget ok\n".
+//
+// =============================================================================
+// COLOR PALETTE (BGRA8888, stored via `mov_d [ptr], eax`)
+// =============================================================================
+//
+// The tri-color segments use a monochromatic dark-to-light BLUE ramp,
+// deliberately distinct from WidgetCpu's warning-gradient (green /
+// yellow / red) so a user reading the two widgets in the same rect
+// immediately parses the memory bar as one quantity subdivided into
+// three parts (not three independent alerts). Every color is stored
+// as a u32 BGRA constant used only in `mov reg, imm` form -- the
+// encoder emits movabs for imm > 0x7FFFFFFF, legal for mov but not
+// for cmp/and.
+//
+// BGRA8888 layout: byte 0 = B, byte 1 = G, byte 2 = R, byte 3 = A.
+//
+//   PWM_COLOR_BG     = 0xFF202020  dark charcoal  (widget-rect background;
+//                                                   matches WidgetCpu bg)
+//   PWM_COLOR_USED   = 0xFFB03018  dark ocean blue  (used-memory segment)
+//   PWM_COLOR_CACHED = 0xFFD07040  medium blue      (cached segment)
+//   PWM_COLOR_FREE   = 0xFFE0B080  light sky blue   (free segment)
+//   PWM_COLOR_LABEL  = 0xFFE0E0E0  near-white       (label glyph fg;
+//                                                     matches WidgetCpu)
+//
+// =============================================================================
+// FRAMEBUFFER STRIDE
+// =============================================================================
+//
+// The M1-002 surface_open landing has not yet minted a real
+// KIND_SURFACE; the caller (Main::main) supplies a stub .bss
+// framebuffer whose stride is fixed at PWM_FB_STRIDE_BYTES=1024
+// (256 pixels * 4 bytes/BGRA). Matches WidgetCpu's constant so a
+// single _pw_fb allocation feeds both widgets. Retired together
+// with WidgetCpu's PWC_FB_STRIDE_BYTES when gfx_surface_open lands.
+//
+// =============================================================================
+// MODULE NAME DEVIATION
+// =============================================================================
+//
+// paideia-as's `module-basename-pascal` compliance flag requires module
+// name = file basename PascalCased. File `widget_mem.pdx` -> module
+// `WidgetMem`. Cross-module callers (Main::main) invoke this surface
+// through `mem_widget_render` below.
+//
+// =============================================================================
+// EXTENDED-ARITY NOTE (mirrors WidgetCpu)
+// =============================================================================
+//
+// The R102.M2-002 issue text names a 5-arg signature (fb, x0, y0, w, h).
+// The extension to 6 args (adding snap_ptr) is deliberate and mirrors
+// WidgetCpu::cpu_widget_render -- pdxwatch's M1-era has no shared-
+// global snapshot slot so the caller (Main::main) has to pass its
+// `_pw_snapshot` address explicitly. When M1-002 introduces a widget-
+// registry global that holds the active snapshot pointer, the
+// signature narrows back to the 5-arg shape for both widgets.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (encoder invariants for paideia-as >= 0.36)
+// =============================================================================
+//
+//   - Module name PascalCase basename (`WidgetMem`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0` / `cmp reg, N`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). BGRA
+//     color constants (0xFFxxxxxx band) are used only in `mov reg, imm`.
+//   - No `imul` mnemonic at all (neither 2-op nor 3-op). All fixed-
+//     constant multiplications use shl / shl+add. Runtime-value
+//     multiplications by 16 (cached-KiB derivation) and by 8 (label-
+//     glyph advance) use shl reg, N with N in imm8 range.
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`.
+//   - Every 32-bit BGRA pixel store lives inside pwm_gfx_fill_rect
+//     and uses the sized `mov_d [mem], rax` mnemonic (G1 discipline).
+//   - r11 is scratch (paideia-as reserved -- never touched in this module).
+//   - SysV alignment: every nested-call function pushes an ODD count of
+//     8-byte callee-save registers (or an even count + one pad push) so
+//     `rsp % 16 == 0` at every call boundary.
+//   - `pub let` single-line declarations only (multi-line `pub let ="..."`
+//     is a paideia-as pitfall).
+//   - Labels prefixed `pwm_*`; substring "loop" avoided defensively
+//     (labels use `_iter_` / `_scan_` / `_step_`); reserved keywords
+//     (`loop`, `if`, `then`, `else`, `test`) NEVER appear as labels.
+
+module WidgetMem = structure {
+
+  // ==========================================================================
+  // Dimensions + limits
+  // ==========================================================================
+
+  // Bar geometry (in pixels). Single-row widget (unlike WidgetCpu's
+  // per-CPU stack), so no ROW_PITCH constant is needed.
+  pub let PWM_BAR_HEIGHT             : u64 = 8
+  pub let PWM_LABEL_WIDTH_PX         : u64 = 72        // label area (9 glyph
+                                                       //  cells at 8px advance)
+  pub let PWM_GLYPH_ADVANCE_PX       : u64 = 8
+  pub let PWM_GLYPH_HEIGHT_PX        : u64 = 8
+  pub let PWM_LABEL_GLYPH_COUNT      : u64 = 9         // "mem LLL.L"
+
+  // Bar-area total width (matches WidgetCpu's PWC_BAR_AREA_MAX_PX so
+  // both widgets share visual alignment when stacked in one surface).
+  pub let PWM_BAR_AREA_MAX_PX        : u64 = 128
+
+  // Framebuffer stride (bytes per row). Fixed at 1024 for the M1-era
+  // stub fb Main::main allocates as .bss (256px * 4 BGRA). Retired
+  // when gfx_surface_open lands and SurfaceHandle carries stride.
+  pub let PWM_FB_STRIDE_BYTES        : u64 = 1024
+
+  // ==========================================================================
+  // Memory-pool proxy constants (see §MEMORY-STAT SOURCE).
+  //
+  //   PWM_MEM_TOTAL_KB           physical-RAM pool assumption
+  //                              (262144 KiB = 256 MiB, matching
+  //                               QEMU's default -m 256 boot line;
+  //                               swapped to a live sys_meminfo read
+  //                               when that syscall lands).
+  //   PWM_KB_PER_PIXEL_SHIFT     scale factor from KiB to bar-pixel:
+  //                              TOTAL_KB / BAR_AREA_MAX_PX
+  //                              = 262144 / 128 = 2048 KiB/px
+  //                              = 2 MiB per pixel.
+  //                              log2(2048) = 11 -- so pixel-width
+  //                              from KiB is a single `shr reg, 11`
+  //                              (no imul, no div; encoder-safe).
+  //   PWM_CACHE_KB_PER_TASK_SHIFT  16 KiB per live task
+  //                                (proxy; shl reg, 4 is one insn).
+  // ==========================================================================
+  pub let PWM_MEM_TOTAL_KB           : u64 = 262144
+  pub let PWM_KB_PER_PIXEL_SHIFT     : u64 = 11        // 2048 KiB / px
+  pub let PWM_CACHE_KB_PER_TASK_SHIFT : u64 = 4        // 16 KiB per task_seen
+
+  // ==========================================================================
+  // BGRA8888 colors (see §COLOR PALETTE).
+  // ==========================================================================
+  pub let PWM_COLOR_BG               : u64 = 0xFF202020
+  pub let PWM_COLOR_USED             : u64 = 0xFFB03018
+  pub let PWM_COLOR_CACHED           : u64 = 0xFFD07040
+  pub let PWM_COLOR_FREE             : u64 = 0xFFE0B080
+  pub let PWM_COLOR_LABEL            : u64 = 0xFFE0E0E0
+
+  // ==========================================================================
+  // Snapshot field offsets (mirror src/collectors.pdx). Named locally so
+  // widget code reads without cross-module import churn.
+  // ==========================================================================
+  pub let PWM_SNAP_OFF_REFRESH_COUNT   : u64 = 16
+  pub let PWM_SNAP_OFF_TOTAL_RSS_KB    : u64 = 104
+  pub let PWM_SNAP_OFF_TASK_SEEN       : u64 = 176
+
+  // ==========================================================================
+  // Error sentinels. Collectors owns 0xFFFFE200..0xFFFFE20F; WidgetCpu
+  // claims 0xFFFFE210..0xFFFFE21F. WidgetMem claims the next 16-slot
+  // sub-band 0xFFFFE220..0xFFFFE22F for its own fault surface.
+  // ==========================================================================
+  pub let PWM_OK                     : u64 = 0
+  pub let PWM_ERR_BAD_FB_PTR         : u64 = 0xFFFFE220
+  pub let PWM_ERR_BAD_SNAP_PTR       : u64 = 0xFFFFE221
+  pub let PWM_ERR_RECT_TOO_SMALL     : u64 = 0xFFFFE222
+
+  // ==========================================================================
+  // SC+ syscall constants
+  // ==========================================================================
+  pub let PWM_SYS_DEBUG_PUTS         : u64 = 12
+  pub let PWM_FINGERPRINT_LEN        : u64 = 23        // "pdxwatch mem-widget ok\n"
+
+  // ==========================================================================
+  // Widget-owned .bss scratch:
+  //   _pwm_fp_emitted            [u8; 8]  one-shot flag: 0=pending, 1=done
+  //   _pwm_fp_str                [u8; 32] fingerprint string composed
+  //                                       byte-wise on first render
+  //   _pwm_prior_total_rss_kb    [u8; 8]  reserved for sys_meminfo landing
+  // Everything zeroed by .bss loader; no explicit init required.
+  // ==========================================================================
+  pub let mut _pwm_fp_emitted            : [u8; 8]  = uninit @align(8)
+  pub let mut _pwm_fp_str                : [u8; 32] = uninit @align(8)
+  pub let mut _pwm_prior_total_rss_kb    : [u8; 8]  = uninit @align(8)
+
+  // ==========================================================================
+  // pwm_sys_debug_puts(buf_ptr, count) -> u64
+  //
+  // Thin wrapper around SC+ sysno 12 (sys_debug_puts). Emits `count`
+  // bytes from user VA `buf_ptr` to the kernel-owned debug channel
+  // (bypasses normal fd routing -- see design/user/syscall-table.md
+  // row 12). Same shape as WidgetCpu's pwc_sys_debug_puts.
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2 < 4). Leaf.
+  // ==========================================================================
+  pub let pwm_sys_debug_puts : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (buf_ptr: u64) (count: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch.M2-002 (pdxwatch#4): SC+ sysno 12 (sys_debug_puts) wrapper. SysV rdi=buf_ptr / rsi=count pass through unchanged to SYSCALL rdi/rsi. mov rax, 12; syscall; ret. Kernel-owned debug channel (bypasses fd routing) -- design/user/syscall-table.md row 12. Sole consumer: pwm_emit_fingerprint below, which fires exactly once on the first successful mem_widget_render call. Leaf: rcx/r11 SYSCALL-clobbered (both SysV caller-save). Byte-for-byte replica of WidgetCpu::pwc_sys_debug_puts -- when the shared gfx_stubs module lands both wrappers collapse into one.",
+      block: {
+        mov rax, 12;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwm_gfx_fill_rect(fb_ptr, x, y, w, h, color) -> u64
+  //
+  // STUB(libpdx-gfx.M2-002): inline BGRA8888 rect-fill primitive.
+  // Byte-for-byte replica of WidgetCpu::pwc_gfx_fill_rect. When
+  // libpdx-gfx.M2-002 lands (`gfx_fill_rect(surf, x, y, w, h, color)`),
+  // both this stub and pwc_gfx_fill_rect retire in one round and the
+  // callsites below rewire to the library entry.
+  //
+  // Contract: identical to pwc_gfx_fill_rect (see widget_cpu.pdx).
+  //   rdi = fb_ptr, rsi = x, rdx = y, rcx = w, r8 = h, r9 = color
+  //   -> rax = 0 always
+  //
+  // Register plan: 5-push callee-save (rbx=fb, r12=x, r13=y, r14=w,
+  // r15=h) + 1-slot local for color = 40B pushes + 16B locals.
+  // rsp entry %16==8 -> 8+40=48 %16==0 -> sub rsp,16 keeps alignment.
+  // ==========================================================================
+  pub let pwm_gfx_fill_rect : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fb_ptr: u64) (x: u64) (y: u64) (w: u64) (h: u64) (color: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M2-002 (pdxwatch#4): inline BGRA fill-rect stub for libpdx-gfx.M2-002 pre-landing. Byte-for-byte replica of WidgetCpu::pwc_gfx_fill_rect. Two nested loops (row 0..h, col 0..w). Row base = fb + (y+row)*STRIDE + x*4. STRIDE=1024 hard-coded (retired when SurfaceHandle carries stride). Pixel store: `mov_d [ptr], rax` sized 32-bit BGRA write (G1 discipline: bare `mov [mem], eax` widens to REX.W and clobbers 8 bytes; use the sized mnemonic). Register plan: push rbx/r12/r13/r14/r15 (5 pushes = 40B, %16==0 after entry+40), sub rsp, 16 (color local slot; %16 preserved). rbx=fb, r12=x, r13=y, r14=w, r15=h, [rsp+0]=color. r10 outer row cursor (0..h), rcx inner col cursor (0..w), r9 row_base pointer, rax pixel payload -- all caller-save, no nested calls means r10/rcx safe as scratch. y_offset = row_y * 1024 computed as `shl r9, 10` (no imul; STRIDE is a power-of-two). x_offset = x*4 via `shl rcx, 2`. Zero-w or zero-h short-circuits via `cmp/jae` before the store, so the caller can pass w=0 to skip a segment. Return xor rax, rax at exit (0=OK). Encoder discipline: no `test`, no imul, every immediate in cmp fits imm8 (0, 1, 2, 4, 8, 10, 16). Labels pwm_fr_row_step / pwm_fr_row_end / pwm_fr_col_step / pwm_fr_col_end prefixed pwm_, no reserved keywords.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                             // rbx = fb_ptr
+        mov r12, rsi;                             // r12 = x
+        mov r13, rdx;                             // r13 = y
+        mov r14, rcx;                             // r14 = w
+        mov r15, r8;                              // r15 = h
+        mov [rsp + 0], r9;                        // color local
+
+        xor r10, r10;                             // row = 0
+        pwm_fr_row_step:
+        cmp r10, r15;
+        jae pwm_fr_row_end;
+
+        // row_base = fb + (y+row)*1024 + x*4
+        mov r9, r13;
+        add r9, r10;                              // r9 = row_y
+        shl r9, 10;                               // r9 = row_y * 1024
+        add r9, rbx;                              // r9 = fb + row_y*1024
+        mov rcx, r12;                             // rcx = x
+        shl rcx, 2;                               // rcx = x*4
+        add r9, rcx;                              // r9 = row_base
+
+        xor rcx, rcx;                             // col = 0
+        pwm_fr_col_step:
+        cmp rcx, r14;
+        jae pwm_fr_col_end;
+        mov rax, [rsp + 0];                       // color
+        mov_d [r9 + 0], rax;                      // sized 32-bit BGRA write
+        add r9, 4;
+        add rcx, 1;
+        jmp pwm_fr_col_step;
+        pwm_fr_col_end:
+
+        add r10, 1;
+        jmp pwm_fr_row_step;
+        pwm_fr_row_end:
+
+        xor rax, rax;
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwm_gfx_draw_glyph(fb_ptr, x, y, glyph, fg, bg) -> u64
+  //
+  // STUB(libpdx-font.M2-001 + libpdx-gfx.M2-004): draws a single glyph
+  // cell (8x8) at (x, y). Byte-for-byte replica of WidgetCpu's stub.
+  //
+  // M2-002 stub semantics: fill the entire 8x8 cell with `fg`. Real
+  // semantics (libpdx-gfx.M2-004): walk the GlyphRef bitmap for
+  // `glyph`, write `fg` for set bits and `bg` for clear bits.
+  //
+  // Contract identical to pwc_gfx_draw_glyph.
+  //   rdi = fb_ptr, rsi = x, rdx = y, rcx = glyph, r8 = fg, r9 = bg
+  //   -> rax = 0 always
+  // ==========================================================================
+  pub let pwm_gfx_draw_glyph : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (fb_ptr: u64) (x: u64) (y: u64) (glyph: u64) (fg: u64) (bg: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "pdxwatch.M2-002 (pdxwatch#4): libpdx-font.M2-001 + libpdx-gfx.M2-004 pre-landing stub. Byte-for-byte replica of WidgetCpu::pwc_gfx_draw_glyph. Draws a fg-colored 8x8 cell at (x, y). Delegates to pwm_gfx_fill_rect with w=8/h=8/color=fg. SysV rdi/rsi/rdx pass through unchanged; rcx (glyph) is ignored; r8 (fg) is remapped to color arg (r9 slot for fill_rect); r9 (bg) is ignored. Register plan: 4-push callee-save (rbx=fb, r12=fg, r13=x, r14=y) + 1-push pad (rax discarded) = 40B pushes. Entry rsp %16==8; +40 = 48 %16==0 -> aligned for the pwm_gfx_fill_rect call. Encoder discipline: no test, no imul, immediates fit imm8. Labels: none needed (linear body).",
+      block: {
+        push rbx;                                 // preserve for outer callers
+        push r12;                                 // r12 = fg
+        push r13;                                 // r13 = x
+        push r14;                                 // r14 = y
+        push rax;                                 // pad -> rsp %16 == 0 for nested call
+
+        mov rbx, rdi;                             // fb
+        mov r13, rsi;                             // x
+        mov r14, rdx;                             // y
+        mov r12, r8;                              // fg (color)
+
+        // Delegate to pwm_gfx_fill_rect(fb, x, y, 8, 8, fg)
+        mov rdi, rbx;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, 8;                               // PWM_GLYPH_ADVANCE_PX
+        mov r8, 8;                                // PWM_GLYPH_HEIGHT_PX
+        mov r9, r12;                              // color = fg
+        call pwm_gfx_fill_rect;
+
+        xor rax, rax;
+        pop rcx;                                  // discard pad
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pwm_emit_fingerprint() -> u64
+  //
+  // One-shot fingerprint emission. Composes "pdxwatch mem-widget ok\n"
+  // (23 bytes) into _pwm_fp_str via three qword stores, then calls
+  // pwm_sys_debug_puts. Guarded by _pwm_fp_emitted (0 -> emit + set,
+  // 1 -> skip). Returns 1 on emit, 0 on skip. Byte-for-byte replica
+  // of WidgetCpu::pwc_emit_fingerprint modulo the middle qword
+  // (" mem-wid" instead of " cpu-wid").
+  // ==========================================================================
+  pub let pwm_emit_fingerprint : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M2-002 (pdxwatch#4): one-shot 'pdxwatch mem-widget ok\\n' emit via SC+ sysno 12 sys_debug_puts. Guard: mov rax, [rip + _pwm_fp_emitted]; cmp rax, 0; jne skip (already emitted). Compose: three qword stores into _pwm_fp_str encoding the 23-byte string in ASCII LE (first and third qword identical to WidgetCpu's fingerprint since both end '...widget ok\\n'; middle qword is ' mem-wid' instead of ' cpu-wid'). Emit: lea rdi, [rip + _pwm_fp_str]; mov rsi, 23; call pwm_sys_debug_puts. Mark: mov rax, 1; mov [rip + _pwm_fp_emitted], rax. Return 1 (emitted) or 0 (skipped). Register plan: 3 pushes (rbx, r12 reserved, rax pad) = 24B; entry rsp %16==8, +24 = 32 %16==0 -> aligned for the syscall wrapper call. Encoder discipline: no test (cmp rax, 0 for the guard); no imul; every color/string qword constant used only in mov (movabs form legal). Labels pwm_fp_emit / pwm_fp_skip / pwm_fp_done prefixed pwm_.",
+      block: {
+        push rbx;
+        push r12;                                 // reserved (unused, keeps alignment shape)
+        push rax;                                 // pad -> %16=0 (3 pushes = 24B, entry 8+24=32 %16==0)
+
+        // Guard: skip if already emitted.
+        mov rax, [rip + _pwm_fp_emitted];
+        cmp rax, 0;
+        jne pwm_fp_skip;
+
+        // Compose 23-byte string into _pwm_fp_str.
+        // "pdxwatch": bytes p(70) d(64) x(78) w(77) a(61) t(74) c(63) h(68)
+        //             LE qword = 0x68_63_74_61_77_78_64_70
+        mov rax, 0x6863746177786470;              // "pdxwatch" (LE)
+        mov [rip + _pwm_fp_str + 0], rax;
+        // " mem-wid": bytes SP(20) m(6d) e(65) m(6d) -(2d) w(77) i(69) d(64)
+        //             LE qword = 0x64_69_77_2d_6d_65_6d_20
+        mov rax, 0x6469772d6d656d20;              // " mem-wid" (LE)
+        mov [rip + _pwm_fp_str + 8], rax;
+        // "get ok\n\0": bytes g(67) e(65) t(74) SP(20) o(6f) k(6b) LF(0a) NUL(00)
+        //                LE qword = 0x00_0a_6b_6f_20_74_65_67
+        mov rax, 0x000a6b6f20746567;              // "get ok\n\0" (LE)
+        mov [rip + _pwm_fp_str + 16], rax;
+
+        // Emit via sys_debug_puts.
+        lea rdi, [rip + _pwm_fp_str];
+        mov rsi, 23;                              // PWM_FINGERPRINT_LEN
+        call pwm_sys_debug_puts;
+
+        // Mark emitted.
+        mov rax, 1;
+        mov [rip + _pwm_fp_emitted], rax;
+
+        // Return 1 (emitted).
+        mov rax, 1;
+        jmp pwm_fp_done;
+
+        pwm_fp_skip:
+        xor rax, rax;
+
+        pwm_fp_done:
+        pop rcx;                                  // discard pad (was pushed as rax)
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mem_widget_render(fb_ptr, snap_ptr, x0, y0, width, height) -> u64
+  //
+  // Renders the tri-color memory bar (used / cached / free) into the
+  // (x0, y0, width, height) rect of the caller-supplied BGRA8888
+  // framebuffer. Reads total_rss_kb + task_seen from `snap_ptr` and
+  // derives the three segment widths via the KB-to-pixel scale
+  // (single `shr reg, 11`).
+  //
+  // Contract:
+  //   rdi = fb_ptr     VA of a BGRA8888 back-buffer, stride
+  //                    PWM_FB_STRIDE_BYTES bytes/row.
+  //   rsi = snap_ptr   VA of a CollectSnapshot (>= 256 bytes,
+  //                    populated by Collectors::collect_init +
+  //                    collect_tick).
+  //   rdx = x0         left edge of the widget rect (pixels)
+  //   rcx = y0         top edge of the widget rect (pixels)
+  //   r8  = width      widget rect width (pixels; must be >= 96)
+  //   r9  = height     widget rect height (pixels; must be >= 10)
+  //
+  // Returns:
+  //   rax = 0                        rendered OK
+  //   rax = PWM_ERR_BAD_FB_PTR       fb_ptr was 0
+  //   rax = PWM_ERR_BAD_SNAP_PTR     snap_ptr was 0
+  //   rax = PWM_ERR_RECT_TOO_SMALL   width < 96 or height < 10
+  //
+  // Register plan: 5-push callee-save (rbx=fb, r12=snap, r13=x0,
+  // r14=y0, r15=width) + sub rsp, 48 (6 stack locals). Entry rsp
+  // %16==8, +40 = 48 %16==0, +48 keeps aligned.
+  //
+  // Stack locals ([rsp + K]):
+  //   [rsp +  0] = height       (u64)
+  //   [rsp +  8] = used_px      (u64; 0..128)
+  //   [rsp + 16] = cached_px    (u64; 0..128)
+  //   [rsp + 24] = free_px      (u64; 0..128)
+  //   [rsp + 32] = label_i      (u64; live during label loop only)
+  //   [rsp + 40] = reserved / scratch
+  // ==========================================================================
+  pub let mem_widget_render : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (fb_ptr: u64) (snap_ptr: u64) (x0: u64) (y0: u64) (width: u64) (height: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "pdxwatch.M2-002 (pdxwatch#4): tri-color memory-bar widget render entry. Register plan: 5-push callee-save (rbx=fb, r12=snap, r13=x0, r14=y0, r15=width) + sub rsp, 48 for 6 stack locals. Entry rsp%16==8; +40 pushes = %16==0; +48 locals keeps %16==0 for every nested call (pwm_gfx_fill_rect, pwm_gfx_draw_glyph, pwm_emit_fingerprint). Locals: [rsp+0]=height, [rsp+8]=used_px, [rsp+16]=cached_px, [rsp+24]=free_px, [rsp+32]=label_i, [rsp+40]=reserved. Phase A (arg validation): cmp rdi, 0 / je bad_fb; cmp rsi, 0 / je bad_snap; width must be >= 96 (label area 72 + bar area 128 -- wait, that would need >= 200; but the widget only uses width for the bg fill and does not size the bar area to width; the 96 gate is the minimum label + non-zero bar reach); height must be >= 10 (room for the 8-px bar plus 2 px margin). Phase B (paint widget background): call pwm_gfx_fill_rect(fb, x0, y0, width, height, PWM_COLOR_BG=0xFF202020) so per-segment draws only need to overpaint the bar and label subregions. Phase C (compute used_px): mov rax, [r12 + 104] (PWM_SNAP_OFF_TOTAL_RSS_KB); shr rax, 11 (PWM_KB_PER_PIXEL_SHIFT -- KiB / 2048 = pixels, encoder-safe single-insn); cmp rax, 128 (PWM_BAR_AREA_MAX_PX); jbe used_ok; mov rax, 128 (saturate); used_ok: mov [rsp+8], rax. Phase D (compute cached_px): mov rax, [r12 + 176] (PWM_SNAP_OFF_TASK_SEEN); shl rax, 4 (PWM_CACHE_KB_PER_TASK_SHIFT -- task_seen * 16 KiB = cached_kb, M1-era proxy); shr rax, 11 (KiB -> px); cmp rax, 128; jbe cached_ok; mov rax, 128; cached_ok: mov [rsp+16], rax. Phase D-bis (clamp used+cached <= 128 so free stays non-negative and the three-segment sum fits the bar exactly): mov rax, [rsp+8]; add rax, [rsp+16]; cmp rax, 128; jbe sum_ok; mov rax, 128; mov rcx, [rsp+8]; sub rax, rcx; mov [rsp+16], rax (trim cached to fit remainder); sum_ok: (post-clamp invariant: used_px + cached_px <= 128). Phase D-ter (compute free_px = 128 - used_px - cached_px): mov rax, [rsp+8]; add rax, [rsp+16]; mov rcx, 128; sub rcx, rax; mov [rsp+24], rcx. Phase E (draw label glyph cells): 9 iterations of pwm_gfx_draw_glyph at (x0 + 8*i, y0) with fg=PWM_COLOR_LABEL, bg=PWM_COLOR_BG, glyph=i (ignored by stub). Loop: xor rax, rax; mov [rsp+32], rax (label_i = 0). pwm_mwr_lbl_step: mov rax, [rsp+32]; cmp rax, 9 (PWM_LABEL_GLYPH_COUNT); jae lbl_end. Compute glyph_x = x0 + i * 8 = x0 + (i << 3): mov rdi, rbx (fb); mov rcx, rax; shl rcx, 3; mov rsi, r13; add rsi, rcx (rsi = glyph_x); mov rdx, r14 (y0); mov rcx, [rsp+32] (glyph = label_i, ignored by stub); mov r8, 0xFFE0E0E0 (PWM_COLOR_LABEL fg); mov r9, 0xFF202020 (PWM_COLOR_BG bg); // STUB(libpdx-font.M2-001): retire when libpdx-font glyph store lands. call pwm_gfx_draw_glyph. mov rax, [rsp+32]; add rax, 1; mov [rsp+32], rax; jmp lbl_step. lbl_end: Phase F (draw the three bar segments). bar_x_base = x0 + 72 (PWM_LABEL_WIDTH_PX); bar_y = y0. Segment 1 (used): mov rdi, rbx; mov rsi, r13; add rsi, 72; mov rdx, r14; mov rcx, [rsp+8]; mov r8, 8; mov r9, 0xFFB03018 (PWM_COLOR_USED); call pwm_gfx_fill_rect. Segment 2 (cached), offset by used_px: mov rdi, rbx; mov rsi, r13; add rsi, 72; add rsi, [rsp+8]; mov rdx, r14; mov rcx, [rsp+16]; mov r8, 8; mov r9, 0xFFD07040 (PWM_COLOR_CACHED); call pwm_gfx_fill_rect. Segment 3 (free), offset by used_px + cached_px: mov rdi, rbx; mov rsi, r13; add rsi, 72; add rsi, [rsp+8]; add rsi, [rsp+16]; mov rdx, r14; mov rcx, [rsp+24]; mov r8, 8; mov r9, 0xFFE0B080 (PWM_COLOR_FREE); call pwm_gfx_fill_rect. Note: pwm_gfx_fill_rect treats w==0 as a no-op (short-circuits before the store loop) so a fully-consumed bar with free_px==0 does not misfire. Phase G (fingerprint one-shot): call pwm_emit_fingerprint. Phase H (return 0): xor rax, rax; unwind (add rsp, 48; 5-pop; ret). Error tails: mov rax, sentinel; unwind. Encoder discipline: no test (all cmp reg, 0 / cmp reg, N); no imul (every multiplication power-of-two: shl 3 for glyph advance, shl 4 for cache-per-task, shr 11 for KiB->px, shl 10 for stride inside pwm_gfx_fill_rect); no `and reg, imm64`; no `cmp reg, [mem]` (every compare loads through rax or a scratch first); no `mul`. Every 32-bit pixel store lives inside pwm_gfx_fill_rect (mov_d). Every color constant loaded via mov reg, imm (movabs form for the 0xFF-prefixed 4-byte values). Immediates in cmp fit imm8 (0, 8, 9, 10, 96, 128); mov-immediates that need imm32 (72, 262144 unused directly here) never appear in cmp/and. Labels prefixed pwm_mwr_* (no reserved keyword substrings; used _lbl_step / _sum_ok / _used_ok / _cached_ok / _bad_ / _rect_small).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 48;                              // 6 stack slots
+
+        // ---- Phase A: argument validation ---------------------------------
+        cmp rdi, 0;
+        je pwm_mwr_bad_fb;
+        cmp rsi, 0;
+        je pwm_mwr_bad_snap;
+        // width >= 96 required (label area 72 + 24 minimum bar reach)
+        cmp r8, 96;
+        jb pwm_mwr_rect_small;
+        // height >= 10 required (8-px bar + 2-px margin)
+        cmp r9, 10;
+        jb pwm_mwr_rect_small;
+
+        mov rbx, rdi;                             // rbx = fb_ptr
+        mov r12, rsi;                             // r12 = snap_ptr
+        mov r13, rdx;                             // r13 = x0
+        mov r14, rcx;                             // r14 = y0
+        mov r15, r8;                              // r15 = width
+        mov [rsp + 0], r9;                        // height
+
+        // ---- Phase B: paint widget-rect background ------------------------
+        mov rdi, rbx;
+        mov rsi, r13;                             // x0
+        mov rdx, r14;                             // y0
+        mov rcx, r15;                             // width
+        mov r8, [rsp + 0];                        // height
+        mov r9, 0xFF202020;                       // PWM_COLOR_BG
+        call pwm_gfx_fill_rect;
+
+        // ---- Phase C: used_px = total_rss_kb >> 11  (saturate at 128) ----
+        mov rax, [r12 + 104];                     // PWM_SNAP_OFF_TOTAL_RSS_KB
+        shr rax, 11;                              // PWM_KB_PER_PIXEL_SHIFT
+        cmp rax, 128;                             // PWM_BAR_AREA_MAX_PX
+        jbe pwm_mwr_used_ok;
+        mov rax, 128;
+        pwm_mwr_used_ok:
+        mov [rsp + 8], rax;                       // used_px
+
+        // ---- Phase D: cached_px = (task_seen << 4) >> 11 (proxy) ---------
+        mov rax, [r12 + 176];                     // PWM_SNAP_OFF_TASK_SEEN
+        shl rax, 4;                               // PWM_CACHE_KB_PER_TASK_SHIFT
+                                                  //  -> cached_kb
+        shr rax, 11;                              // -> cached_px
+        cmp rax, 128;
+        jbe pwm_mwr_cached_ok;
+        mov rax, 128;
+        pwm_mwr_cached_ok:
+        mov [rsp + 16], rax;                      // cached_px
+
+        // ---- Phase D-bis: clamp used_px + cached_px <= 128 ---------------
+        mov rax, [rsp + 8];
+        add rax, [rsp + 16];
+        cmp rax, 128;
+        jbe pwm_mwr_sum_ok;
+        // Overflow: trim cached_px to fit remainder.
+        mov rax, 128;
+        mov rcx, [rsp + 8];
+        sub rax, rcx;                             // rax = 128 - used_px
+        mov [rsp + 16], rax;                      // cached_px = 128 - used_px
+        pwm_mwr_sum_ok:
+
+        // ---- Phase D-ter: free_px = 128 - used_px - cached_px ------------
+        mov rax, [rsp + 8];
+        add rax, [rsp + 16];
+        mov rcx, 128;
+        sub rcx, rax;
+        mov [rsp + 24], rcx;                      // free_px
+
+        // ---- Phase E: draw the 9-glyph label cell strip -----------------
+        xor rax, rax;
+        mov [rsp + 32], rax;                      // label_i = 0
+
+        pwm_mwr_lbl_step:
+        mov rax, [rsp + 32];
+        cmp rax, 9;                               // PWM_LABEL_GLYPH_COUNT
+        jae pwm_mwr_lbl_end;
+
+        // glyph_x = x0 + label_i * PWM_GLYPH_ADVANCE_PX (8)
+        mov rdi, rbx;                             // fb
+        mov rcx, rax;                             // label_i
+        shl rcx, 3;                               // label_i * 8
+        mov rsi, r13;
+        add rsi, rcx;                             // rsi = glyph_x
+        mov rdx, r14;                             // y0 (single-row widget)
+        mov rcx, [rsp + 32];                      // glyph = label_i (stub ignores)
+        mov r8, 0xFFE0E0E0;                       // PWM_COLOR_LABEL (fg)
+        mov r9, 0xFF202020;                       // PWM_COLOR_BG (bg)
+        // STUB(libpdx-font.M2-001): retire when libpdx-font glyph store lands.
+        call pwm_gfx_draw_glyph;
+
+        mov rax, [rsp + 32];
+        add rax, 1;
+        mov [rsp + 32], rax;
+        jmp pwm_mwr_lbl_step;
+        pwm_mwr_lbl_end:
+
+        // ---- Phase F: draw three bar segments (used / cached / free) ----
+        // bar_x_base = x0 + PWM_LABEL_WIDTH_PX (72); bar_y = y0.
+
+        // Segment 1: used (dark ocean blue).
+        mov rdi, rbx;                             // fb
+        mov rsi, r13;
+        add rsi, 72;                              // bar_x = x0 + 72
+        mov rdx, r14;                             // bar_y = y0
+        mov rcx, [rsp + 8];                       // used_px
+        mov r8, 8;                                // PWM_BAR_HEIGHT
+        mov r9, 0xFFB03018;                       // PWM_COLOR_USED
+        call pwm_gfx_fill_rect;
+
+        // Segment 2: cached (medium blue), offset by used_px.
+        mov rdi, rbx;
+        mov rsi, r13;
+        add rsi, 72;                              // bar_x
+        add rsi, [rsp + 8];                       // += used_px
+        mov rdx, r14;                             // bar_y
+        mov rcx, [rsp + 16];                      // cached_px
+        mov r8, 8;
+        mov r9, 0xFFD07040;                       // PWM_COLOR_CACHED
+        call pwm_gfx_fill_rect;
+
+        // Segment 3: free (light sky blue), offset by used_px + cached_px.
+        mov rdi, rbx;
+        mov rsi, r13;
+        add rsi, 72;                              // bar_x
+        add rsi, [rsp + 8];                       // += used_px
+        add rsi, [rsp + 16];                      // += cached_px
+        mov rdx, r14;                             // bar_y
+        mov rcx, [rsp + 24];                      // free_px
+        mov r8, 8;
+        mov r9, 0xFFE0B080;                       // PWM_COLOR_FREE
+        call pwm_gfx_fill_rect;
+
+        // ---- Phase G: fingerprint (one-shot) ----------------------------
+        call pwm_emit_fingerprint;
+
+        // ---- Phase H: success return ------------------------------------
+        xor rax, rax;                             // PWM_OK
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pwm_mwr_bad_fb:
+        mov rax, 0xFFFFE220;                      // PWM_ERR_BAD_FB_PTR
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pwm_mwr_bad_snap:
+        mov rax, 0xFFFFE221;                      // PWM_ERR_BAD_SNAP_PTR
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pwm_mwr_rect_small:
+        mov rax, 0xFFFFE222;                      // PWM_ERR_RECT_TOO_SMALL
+        add rsp, 48;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
