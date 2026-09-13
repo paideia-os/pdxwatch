@@ -2,13 +2,16 @@
 
 **Wave:** R102 userland graphical stack -- reference apps
 **Current milestone:** M5-001 signed-release closer landed
-(pdxwatch#10) -- **v1.2.0 cut (dual-sign pass pending live keys)**
-**Version:** 1.2.0 (M5-001 signed-release closer + M4 witness
-triplet. Version-name note: the M5-001 issue names "1.0.0" as the
-signed-release target, but the semver line advanced through
-v1.1-A/B/C (Track-C real-body + semantic-pipe wave) before this
-milestone landed. Semver monotonicity wins over the milestone name:
-this landing tags v1.2.0. The fingerprint identity
+(pdxwatch#10) -- **v1.2.1 hotfix cut (pdxwatch#15; dual-sign pass
+still pending live keys per v1.2.0)**
+**Version:** 1.2.1 (v1.2.1 hotfix -- pdxwatch#15 widget_net.pdx
+`task_seen` unsigned-wrap fix; see `CHANGELOG.md` `[1.2.1]` and
+§"v1.2.1 hotfix landing details" below. Prior: M5-001 signed-release
+closer + M4 witness triplet. Version-name note: the M5-001 issue
+names "1.0.0" as the signed-release target, but the semver line
+advanced through v1.1-A/B/C (Track-C real-body + semantic-pipe wave)
+before this milestone landed. Semver monotonicity wins over the
+milestone name: v1.2.0 tagged that cut. The fingerprint identity
 `pdxwatch 1.0.0 signed ok` remains verbatim per the M5-001 witness
 contract -- see release/RELEASE-1.2.0.md §1 for the full
 reconciliation.)
@@ -203,6 +206,32 @@ caps.decl churn.
 - Tag command (run by main, not this landing): `git tag -a v1.1.0
   -m "pdxwatch v1.1.0 -- real syscalls + semantic-pipe emit"`.
 
+## v1.2.1 hotfix landing details (pdxwatch#15)
+
+Fixes `WidgetNet::net_widget_render`'s Phase C `task_seen` delta
+computation. The pre-fix body computed
+`sample = task_seen - prior_task_seen` unconditionally, documented
+as "unsigned wrap OK" under the assumption that `task_seen` is
+monotonic tick-over-tick. That assumption is false -- a task-pool
+churn / collector reseed can observe `curr < prior` -- and an
+unguarded subtract in that case wraps to a huge `u64` which the
+existing `min(21, sample)` clamp then rounds UP to
+`PWN_SPARK_HEIGHT_PX - 1` (21): a false full-height sparkline spike
+on every counter decrease, exactly backwards from "no observed
+activity this tick".
+
+- `src/widget_net.pdx`: Phase C now guards the subtract (`cmp rax,
+  rcx` / `jae pwn_nwr_sample_no_reset`); `curr < prior` short-
+  circuits to `sample = 0` instead of subtracting. New label
+  `pwn_nwr_sample_no_reset`. Top-of-file `NET-STAT SOURCE` comment
+  and the `net_widget_render` justification string updated to match.
+- Audited the rest of the pdxwatch tree for the same pattern: no
+  other live rate-derivation subtract shares it (see CHANGELOG
+  `[1.2.1]` entry for the per-file breakdown).
+- `manifest.pdxproj`: `version = 1.2.0` -> `version = 1.2.1`.
+- Tag command (run by main, not this landing): `git tag -a v1.2.1
+  -m "pdxwatch v1.2.1 -- widget_net task_seen unsigned-wrap hotfix"`.
+
 ## Dependencies
 
 - `paideia-as >= 0.36.0` at compile time (per `manifest.pdxproj` +
@@ -268,13 +297,13 @@ Follow-up hotfixes remaining open against v1.2.0:
   libpdx-gfx.M2-002 / libpdx-gfx.M2-003 / libpdx-font.M2-001
   land. Target: v1.3.0.
 - pdxwatch#15 -- widget_net.pdx unsigned-wrap on `task_seen`
-  decrease -> false MAX spike. Target: v1.2.1 hotfix.
+  decrease -> false MAX spike. **landed 2026-09-13 (v1.2.1 hotfix)**.
 
 ## Post-v1.2.0 roadmap
 
-- **v1.2.1 (imminent)** -- pdxwatch#15 hotfix (widget_net
+- **v1.2.1 (landed 2026-09-13)** -- pdxwatch#15 hotfix (widget_net
   unsigned-wrap). Single-file `src/widget_net.pdx` change; no
-  manifest / caps.decl churn.
+  manifest / caps.decl churn beyond the version bump.
 - **v1.3.0** -- pdxwatch#14 stub retirement (three widget modules'
   inline gfx/font stubs), gated on the libpdx-gfx M2 + libpdx-font
   M2 landings.

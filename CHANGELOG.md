@@ -7,8 +7,49 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ## [Unreleased]
 
-(Empty -- follow-up hotfixes tracked as pdxwatch#14 / #15 target the
-next patch releases; see STATUS.md `Post-v1.2.0 roadmap`.)
+(Empty -- pdxwatch#14 stub retirement targets the next patch/minor
+release; see STATUS.md `Post-v1.2.0 roadmap`.)
+
+## [1.2.1] - 2026-09-13
+
+Hotfix release. Closes pdxwatch#15.
+
+### Fixed
+
+- **pdxwatch#15 -- widget_net.pdx `task_seen` unsigned-wrap ->
+  false MAX spike.** `WidgetNet::net_widget_render` Phase C computed
+  `sample = task_seen - prior_task_seen` unconditionally and relied
+  on "unsigned wrap OK; monotonically-captured values guarantee
+  prior <= current". That assumption does not hold: `task_seen` is
+  a per-tick live-count, not a monotonic counter, and a task-pool
+  churn / collector reseed can observe `curr < prior`. When that
+  happened the unguarded `sub` wrapped to a huge `u64`, which the
+  existing `min(21, sample)` clamp then rounded UP to
+  `PWN_SPARK_HEIGHT_PX - 1` (21) -- a spurious full-height sparkline
+  spike on every counter decrease, the opposite of the intended
+  "no observed activity this tick" signal.
+  - Fix: guard the subtract with `cmp rax, rcx` / `jae` before
+    subtracting. `curr >= prior` takes the original safe-subtract +
+    clamp path unchanged; `curr < prior` now short-circuits to
+    `sample = 0` (xor rax, rax) instead of subtracting at all, so
+    the wrap can never occur.
+  - `src/widget_net.pdx`: `net_widget_render` Phase C rewritten
+    (new label `pwn_nwr_sample_no_reset`); the `justification` block
+    and the top-of-file `NET-STAT SOURCE` section comment updated to
+    document the corrected `sample = (curr >= prior) ? curr - prior
+    : 0` contract in place of the retired "unsigned wrap OK"
+    rationale.
+  - No other rate-derivation subtract in the pdxwatch tree shares
+    this pattern: `widget_cpu.pdx`'s `_pwc_prior_total_cpu_ticks` /
+    `_pwc_prior_refresh_count` and `widget_mem.pdx`'s
+    `_pwm_prior_total_rss_kb` scratch slots are declared but not yet
+    read from (reserved for the `sys_cpuinfo` / `sys_meminfo`
+    landings); `collectors.pdx`'s `elapsed_ticks = now_tick -
+    last_tick` subtract relies on `sys_clock_read_ns`'s documented
+    monotonic-clock guarantee, a materially different invariant from
+    a live per-tick task count, so it is left as-is.
+  - `manifest.pdxproj`: `version = 1.2.0` -> `version = 1.2.1`.
+  - Closes #15.
 
 ## [1.2.0] - 2026-09-11
 

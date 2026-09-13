@@ -77,12 +77,19 @@
 // M1-era ACTIVITY PROXY -- the delta between two consecutive
 // collect_tick refreshes approximates system-level throughput:
 //
-//     sample = task_seen - prior_task_seen        (unsigned wrap OK;
-//                                                  monotonically-
-//                                                  captured values
-//                                                  guarantee prior <=
-//                                                  current when the
-//                                                  ring is warm)
+//     sample = (curr >= prior) ? curr - prior : 0
+//
+// v1.2.1 hotfix (pdxwatch#15): task_seen is NOT guaranteed monotonic
+// across every refresh (a task-pool churn / collector reseed can
+// observe curr < prior). The earlier "unsigned wrap OK" assumption
+// was wrong: `sub rax, rcx` on curr < prior wraps to a huge u64,
+// which the downstream `min(21, sample)` clamp then rounds UP to
+// PWN_SPARK_HEIGHT_PX-1 (21) -- a false MAX-height spike on every
+// counter decrease, exactly backwards from the intended "no observed
+// activity this tick" signal. The fix guards the subtract: curr <
+// prior is treated as a counter-reset and reported as sample = 0
+// (track baseline) instead of wrapping. See `net_widget_render`
+// Phase C below.
 //
 // The sample is intentionally left in "task-delta units" rather than
 // pre-scaled to KB/s so the sparkline dynamic range matches its
@@ -716,7 +723,7 @@ module WidgetNet = structure {
   pub let net_widget_render : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (fb_ptr: u64) (snap_ptr: u64) (x0: u64) (y0: u64) (width: u64) (height: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "pdxwatch.M2-003 (pdxwatch#5): per-interface bytes/s sparkline widget render entry. Register plan: 5-push callee-save (rbx=fb, r12=snap, r13=x0, r14=y0, r15=width) + sub rsp, 64 for 8 stack locals. Entry rsp%16==8; +40 pushes = %16==0; +64 locals keeps %16==0 for every nested call (pwn_gfx_fill_rect, pwn_gfx_draw_glyph, pwn_gfx_draw_line, pwn_emit_fingerprint). Locals: [rsp+0]=height, [rsp+8]=sample, [rsp+16]=prev_x, [rsp+24]=prev_y, [rsp+32]=cur_x, [rsp+40]=cur_y, [rsp+48]=iter_i, [rsp+56]=reserved. Phase A (arg validation): cmp rdi, 0 / je bad_fb; cmp rsi, 0 / je bad_snap; width must be >= 240 (60 samples * 4-px pitch); height must be >= 32 (label 8 + gap 2 + sparkline 22). Phase B (paint widget background): call pwn_gfx_fill_rect(fb, x0, y0, width, height, PWN_COLOR_BG=0xFF202020). Phase C (compute sample = task_seen - prior_task_seen): mov rax, [r12 + 176] (PWN_SNAP_OFF_TASK_SEEN); mov rcx, [rip + _pwn_prior_task_seen]; sub rax, rcx (unsigned wrap OK; the delta is small and non-negative when the ring is warm). Clamp to [0, PWN_SPARK_HEIGHT_PX-1]=21: cmp rax, 21; jbe sample_ok; mov rax, 21; sample_ok: mov [rsp+8], rax. Update _pwn_prior_task_seen: mov rax, [r12 + 176]; mov [rip + _pwn_prior_task_seen], rax. Phase D (insert sample into ring[0][head]; iface 0 = offset 0): mov rax, [rip + _pwn_ring_head]; mov rcx, rax; shl rcx, 3 (slot offset = head*8); mov rdx, [rsp+8] (sample); lea rdi, [rip + _pwn_ring]; mov [rdi + rcx], rdx (ring[0][head] = sample). head = (head + 1) mod RING_LEN: add rax, 1; cmp rax, 60; jb head_ok; xor rax, rax; head_ok: mov [rip + _pwn_ring_head], rax. Phase E (draw baseline horizontal reference at bottom of sparkline area): call pwn_gfx_fill_rect(fb, x0, y0+PWN_SPARK_TOP_OFFSET_PX+PWN_SPARK_HEIGHT_PX-1=y0+31, PWN_RING_LEN*PWN_SAMPLE_X_PITCH_PX=240, 1, PWN_COLOR_TRACK=0xFF404040). Phase F (draw label glyph strip at row y0): 9 iterations of pwn_gfx_draw_glyph at (x0 + 8*i, y0) with fg=PWN_COLOR_LABEL, bg=PWN_COLOR_BG, glyph=i (ignored by stub). Loop label_i cursor at [rsp+48]. Phase G (draw sparkline): iterate i=0..RING_LEN, compute ring_idx = (head + i) mod RING_LEN (head is the NEXT-INSERT slot, so ring[head] is the OLDEST unread sample; iterating head..head+59 yields oldest-first in temporal order), sample = ring[0][ring_idx], clamp to 21, cur_x = x0 + i*4 (shl 2), cur_y = y0 + 31 - sample (baseline at y0+31, top at y0+10; sample=0 draws at baseline, sample=21 draws at top). For i>0, call pwn_gfx_draw_line(fb, prev_x, prev_y, cur_x, cur_y, PWN_COLOR_SPARK=0xFF00C0C0). Update prev = cur before next iteration. Phase H (fingerprint one-shot): call pwn_emit_fingerprint. Phase I (return 0): xor rax, rax; unwind (add rsp, 64; 5-pop; ret). Error tails: mov rax, sentinel; unwind. Encoder discipline: no test (all cmp reg, 0 / cmp reg, N); no imul (every multiplication power-of-two: shl 2 for x-pitch and pixel-stride, shl 3 for glyph advance and ring slot pitch, shl 10 for stride inside pwn_gfx_fill_rect); no `and reg, imm64`; no `cmp reg, [mem]` (every compare loads through a scratch first); no `sub reg, [mem]`; no `mul`; no `neg`. Every 32-bit pixel store lives inside pwn_gfx_fill_rect (mov_d). Every color constant loaded via mov reg, imm (movabs form for the 0xFF-prefixed 4-byte values). Immediates in cmp fit imm8 (0, 8, 9, 21, 32, 60, 240); mov-immediates that need imm32 (72, 176) never appear in cmp/and. Labels prefixed pwn_nwr_* (no reserved keyword substrings; used _sample_ok / _head_ok / _lbl_step / _spark_step / _ringidx_ok / _clamp_ok / _no_line / _bad_ / _rect_small).",
+      justification: "pdxwatch.M2-003 (pdxwatch#5): per-interface bytes/s sparkline widget render entry. Register plan: 5-push callee-save (rbx=fb, r12=snap, r13=x0, r14=y0, r15=width) + sub rsp, 64 for 8 stack locals. Entry rsp%16==8; +40 pushes = %16==0; +64 locals keeps %16==0 for every nested call (pwn_gfx_fill_rect, pwn_gfx_draw_glyph, pwn_gfx_draw_line, pwn_emit_fingerprint). Locals: [rsp+0]=height, [rsp+8]=sample, [rsp+16]=prev_x, [rsp+24]=prev_y, [rsp+32]=cur_x, [rsp+40]=cur_y, [rsp+48]=iter_i, [rsp+56]=reserved. Phase A (arg validation): cmp rdi, 0 / je bad_fb; cmp rsi, 0 / je bad_snap; width must be >= 240 (60 samples * 4-px pitch); height must be >= 32 (label 8 + gap 2 + sparkline 22). Phase B (paint widget background): call pwn_gfx_fill_rect(fb, x0, y0, width, height, PWN_COLOR_BG=0xFF202020). Phase C (compute sample = (curr >= prior) ? curr - prior : 0; v1.2.1 hotfix pdxwatch#15): mov rax, [r12 + 176] (PWN_SNAP_OFF_TASK_SEEN, curr); mov rcx, [rip + _pwn_prior_task_seen] (prior); cmp rax, rcx; jae sample_no_reset (curr >= prior, safe to subtract); xor rax, rax; jmp sample_ok (curr < prior -- counter reset / task-pool churn, report sample=0 rather than wrapping); sample_no_reset: sub rax, rcx (sample = curr - prior, no wrap since curr >= prior verified). Clamp to [0, PWN_SPARK_HEIGHT_PX-1]=21: cmp rax, 21; jbe sample_ok; mov rax, 21; sample_ok: mov [rsp+8], rax. (Pre-hotfix this subtracted unconditionally and relied on \"unsigned wrap is OK\"; a curr < prior tick wrapped to a huge u64 that the same clamp rounded UP to 21 -- a false MAX-height spike on every counter decrease. The guard above eliminates that class of bug at the source.) Update _pwn_prior_task_seen: mov rax, [r12 + 176]; mov [rip + _pwn_prior_task_seen], rax. Phase D (insert sample into ring[0][head]; iface 0 = offset 0): mov rax, [rip + _pwn_ring_head]; mov rcx, rax; shl rcx, 3 (slot offset = head*8); mov rdx, [rsp+8] (sample); lea rdi, [rip + _pwn_ring]; mov [rdi + rcx], rdx (ring[0][head] = sample). head = (head + 1) mod RING_LEN: add rax, 1; cmp rax, 60; jb head_ok; xor rax, rax; head_ok: mov [rip + _pwn_ring_head], rax. Phase E (draw baseline horizontal reference at bottom of sparkline area): call pwn_gfx_fill_rect(fb, x0, y0+PWN_SPARK_TOP_OFFSET_PX+PWN_SPARK_HEIGHT_PX-1=y0+31, PWN_RING_LEN*PWN_SAMPLE_X_PITCH_PX=240, 1, PWN_COLOR_TRACK=0xFF404040). Phase F (draw label glyph strip at row y0): 9 iterations of pwn_gfx_draw_glyph at (x0 + 8*i, y0) with fg=PWN_COLOR_LABEL, bg=PWN_COLOR_BG, glyph=i (ignored by stub). Loop label_i cursor at [rsp+48]. Phase G (draw sparkline): iterate i=0..RING_LEN, compute ring_idx = (head + i) mod RING_LEN (head is the NEXT-INSERT slot, so ring[head] is the OLDEST unread sample; iterating head..head+59 yields oldest-first in temporal order), sample = ring[0][ring_idx], clamp to 21, cur_x = x0 + i*4 (shl 2), cur_y = y0 + 31 - sample (baseline at y0+31, top at y0+10; sample=0 draws at baseline, sample=21 draws at top). For i>0, call pwn_gfx_draw_line(fb, prev_x, prev_y, cur_x, cur_y, PWN_COLOR_SPARK=0xFF00C0C0). Update prev = cur before next iteration. Phase H (fingerprint one-shot): call pwn_emit_fingerprint. Phase I (return 0): xor rax, rax; unwind (add rsp, 64; 5-pop; ret). Error tails: mov rax, sentinel; unwind. Encoder discipline: no test (all cmp reg, 0 / cmp reg, N); no imul (every multiplication power-of-two: shl 2 for x-pitch and pixel-stride, shl 3 for glyph advance and ring slot pitch, shl 10 for stride inside pwn_gfx_fill_rect); no `and reg, imm64`; no `cmp reg, [mem]` (every compare loads through a scratch first); no `sub reg, [mem]`; no `mul`; no `neg`. Every 32-bit pixel store lives inside pwn_gfx_fill_rect (mov_d). Every color constant loaded via mov reg, imm (movabs form for the 0xFF-prefixed 4-byte values). Immediates in cmp fit imm8 (0, 8, 9, 21, 32, 60, 240); mov-immediates that need imm32 (72, 176) never appear in cmp/and. Labels prefixed pwn_nwr_* (no reserved keyword substrings; used _sample_no_reset / _sample_ok / _head_ok / _lbl_step / _spark_step / _ringidx_ok / _clamp_ok / _no_line / _bad_ / _rect_small).",
       block: {
         push rbx;
         push r12;
@@ -753,10 +760,21 @@ module WidgetNet = structure {
         mov r9, 0xFF202020;                       // PWN_COLOR_BG
         call pwn_gfx_fill_rect;
 
-        // ---- Phase C: sample = task_seen - prior_task_seen, clamp[0..21] --
-        mov rax, [r12 + 176];                     // PWN_SNAP_OFF_TASK_SEEN
-        mov rcx, [rip + _pwn_prior_task_seen];
-        sub rax, rcx;                             // sample (wrap OK)
+        // ---- Phase C: sample = (curr >= prior) ? curr - prior : 0, clamp[0..21]
+        // v1.2.1 hotfix (pdxwatch#15): guard the subtract against curr <
+        // prior (counter reset / task-pool churn) BEFORE subtracting --
+        // an unguarded `sub` wraps to a huge u64 that the old code's
+        // clamp then rounded UP to 21 (false MAX spike). curr < prior
+        // now reports sample = 0 directly, matching "no observed
+        // activity this tick" instead of "maximum observed activity".
+        mov rax, [r12 + 176];                     // PWN_SNAP_OFF_TASK_SEEN (curr)
+        mov rcx, [rip + _pwn_prior_task_seen];    // prior
+        cmp rax, rcx;                             // curr vs prior
+        jae pwn_nwr_sample_no_reset;              // curr >= prior: safe subtract
+        xor rax, rax;                             // curr < prior: reset -> sample = 0
+        jmp pwn_nwr_sample_ok;
+        pwn_nwr_sample_no_reset:
+        sub rax, rcx;                             // sample = curr - prior (no wrap)
         cmp rax, 21;                              // PWN_SPARK_HEIGHT_PX - 1
         jbe pwn_nwr_sample_ok;
         mov rax, 21;
