@@ -57,12 +57,18 @@
 // SC+ SYSCALL DEPENDENCIES
 // =============================================================================
 //
-//   * sysno 60 = sys_exit(status) -- clean-exit primitive; never
+//   * sysno 60  = sys_exit(status) -- clean-exit primitive; never
 //                returns. Kernel dispatch at src/kernel/core/
 //                syscall/dispatch.pdx. Wired here as pw_sys_exit
 //                so Main::main can terminate the process at the
 //                end of the bounded loop; M3-001's 'q' keydown
 //                path reuses the same wrapper.
+//   * sysno 116 = sys_sched_wait_ns(ns) -- Wave-eps eps-04: blocks
+//                the calling task off the run queue for ns nano-
+//                seconds. Wired here as pw_sys_sched_wait_ns; the
+//                bounded iterate loop calls it once per iteration
+//                to pace the 1 Hz refresh cadence instead of hot-
+//                spinning collect_tick's clock-read interval gate.
 //
 // Both collectors syscalls (sysno 66, 83) are reached transitively
 // through Collectors::collect_init / Collectors::collect_tick and
@@ -115,6 +121,29 @@ module Main = structure {
   // so pw_sys_exit references the SC+ ID in exactly one place.
   // ==========================================================================
   pub let PW_SYS_EXIT : u64 = 60
+
+  // ==========================================================================
+  // sys_sched_wait_ns sysno (design/user/syscall-table.md row 116).
+  // Named here so pw_sys_sched_wait_ns references the SC+ ID in
+  // exactly one place. Wave-eps eps-04 (paideia-os SC+116 landing):
+  // replaces the bounded iterate loop's hot-spin on collect_tick's
+  // clock-read interval gate with a real scheduler wait.
+  // ==========================================================================
+  pub let PW_SYS_SCHED_WAIT_NS : u64 = 116
+
+  // ==========================================================================
+  // Per-iteration wait quantum, in nanoseconds: one full refresh
+  // interval (PW_MAIN_INTERVAL_TICKS=60 ticks * 2^24 ns/tick =
+  // 1_006_632_960 ns, ~1.007s -- see collectors.pdx's PW_TICK_SHIFT=24
+  // derivation). Wave-eps eps-04: the bounded iterate loop previously
+  // called collect_tick back-to-back with no wait between iterations,
+  // relying on collect_tick's own clock-read interval gate ("not yet"
+  // fast-return) to skip work -- a busy-spin that burns CPU polling
+  // pw_sys_clock_ns until wall time advances. Waiting this quantum
+  // once per iteration paces the loop at the documented 1 Hz refresh
+  // cadence and yields the CPU to the scheduler instead of spinning.
+  // ==========================================================================
+  pub let PW_MAIN_REFRESH_WAIT_NS : u64 = 1006632960
 
   // ==========================================================================
   // Backing storage for the CollectSnapshot. Sized at COLLECT_STATE_
@@ -228,6 +257,31 @@ module Main = structure {
     }
 
   // ==========================================================================
+  // pw_sys_sched_wait_ns(ns) -> u64
+  //
+  // Wave-eps eps-04: thin wrapper around SC+ sysno 116 (sys_sched_
+  // wait_ns), landed at paideia-os HEAD (kernel body at src/kernel/
+  // core/syscall/handlers/sys_sched_wait_ns.pdx, Wave UUU). rdi is the
+  // requested wait duration in nanoseconds; the kernel blocks the
+  // calling task off the run queue for (at least) that duration and
+  // returns the actual elapsed ns in rax. Replaces the M1-001 spin-
+  // poll-on-collect_tick's-clock-read pattern with a real scheduler
+  // wait -- Main::main's bounded iterate loop calls this once per
+  // iteration (see the pw_main_iter_step body below) instead of
+  // hot-looping.
+  // ==========================================================================
+  pub let pw_sys_sched_wait_ns : (u64) -> u64 !{sysreg} @{} =
+    fn (ns: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "pdxwatch Wave-eps eps-04: SC+ sysno 116 (sys_sched_wait_ns) wrapper. SysV rdi=ns passes through unchanged to SYSCALL rdi (arity 1, same shape as pw_sys_exit above). mov rax, 116; syscall; ret. Kernel dispatch at src/kernel/core/syscall/dispatch.pdx routes sysno 116 to the sys_sched_wait_ns body (Wave UUU landing); rax on return holds the actual elapsed ns, discarded by every eps-04 caller. Leaf: rcx/r11 SYSCALL-clobbered, both SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and (116 fits imm8); labels none (single basic block).",
+      block: {
+        mov rax, 116;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // Main::main() -> u64
   //
   // The pdxwatch entry point (invoked by the M1-005 _start binder
@@ -247,10 +301,11 @@ module Main = structure {
   //   2. Bounded loop:
   //      for i = 0..PW_MAIN_TICK_BUDGET:
   //          Collectors::collect_tick(&_pw_snapshot)
-  //          (the tick's own interval gate handles the wait;
-  //          collect_tick returns 0 fast when the interval has not
-  //          elapsed, so this is effectively a spin-poll until
-  //          M1-002 introduces a sched-yield primitive)
+  //          render widgets on refresh, poll input, check quit flag
+  //          pw_sys_sched_wait_ns(PW_MAIN_REFRESH_WAIT_NS)
+  //          (Wave-eps eps-04: paces each iteration to one refresh
+  //          interval via a real scheduler wait, replacing the prior
+  //          spin-poll on collect_tick's clock-read interval gate)
   //   3. pw_sys_exit(0)  (never returns)
   //
   // Register plan: 2-push callee-save prologue (rbx / r12) = 16 bytes
@@ -385,6 +440,14 @@ module Main = structure {
         mov rax, [rip + _pw_quit_requested];
         cmp rax, 0;
         jne pw_main_iter_end;                      // user quit -> exit
+
+        // v1.4 (Wave eps eps-04): pace the bounded iterate loop at one
+        // refresh interval per iteration via SC+ sysno 116 (sys_sched_
+        // wait_ns) rather than hot-spinning collect_tick's clock-read
+        // interval gate. Skipped on the user-quit exit path above --
+        // no reason to block the scheduler once teardown has begun.
+        mov rdi, 1006632960;                       // PW_MAIN_REFRESH_WAIT_NS
+        call pw_sys_sched_wait_ns;
 
         add rbx, 1;
         jmp pw_main_iter_step;
