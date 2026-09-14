@@ -16,10 +16,9 @@
 // This module is the M2-001 landing for the pdxwatch reference app.
 // The R102 wave-ordering table names libpdx-gfx.M2-002 (gfx_fill_rect)
 // and libpdx-font.M2-001 (gfx_draw_glyph over the glyph store) as
-// prerequisites; neither library has landed in the pdxwatch link path
-// at this landing time (nor is either source resident anywhere in the
-// paideia-os monorepo). Rather than block the widget on the two
-// upstream landings, this module ships **minimal inline stubs** for
+// prerequisites; neither library had landed in the pdxwatch link path
+// at THIS landing time. Rather than block the widget on the two
+// upstream landings, this module shipped **minimal inline stubs** for
 // the two primitives:
 //
 //   pwc_gfx_fill_rect (fb, x, y, w, h, color)
@@ -28,10 +27,70 @@
 // Every stub is prefixed `pwc_gfx_*` (not `gfx_*`) so a future round
 // that wires the real libpdx-gfx symbols does NOT collide on link, and
 // every stub-callsite carries a `// STUB(libpdx-gfx.M2-*)` marker so a
-// grep-driven audit can enumerate them at wire-up time. The follow-up
-// dependency issue (title: "pdxwatch: retire widget_cpu.pdx libpdx-gfx
-// stubs when libpdx-gfx.M2-002 / libpdx-font.M2-001 land") should be
-// filed in paideia-os/pdxwatch when M1-002 opens the surface_open wire.
+// grep-driven audit can enumerate them at wire-up time.
+//
+// =============================================================================
+// pdxwatch#14 AUDIT (this landing): real libraries exist, still not wired
+// =============================================================================
+//
+// libpdx-gfx has since landed real bodies through `v1.0.0-src`
+// (github.com/paideia-os/libpdx-gfx): `gfx_fill_rect(handle_va, x, y,
+// w, h, color)` and `gfx_draw_glyph(handle_va, x, y, glyph_ptr, fg,
+// bg)` (src/draw_rect.pdx, src/draw_glyph.pdx). libpdx-font has
+// likewise landed real bodies through `v0.6.0`/`v1.0.0-src`
+// (github.com/paideia-os/libpdx-font): `font_lookup_glyph(codepoint)
+// -> glyph_id` and `font_glyph_bitmap(glyph_id, out_ptr, out_max)`
+// (src/font_api.pdx). This audit confirms the two upstream
+// prerequisites this module's stubs were waiting on are, in fact,
+// real and stable today.
+//
+// The stubs are NOT retired this landing, for three concrete reasons
+// verified against both libraries' actual shipped source (not
+// assumption):
+//
+//   1. **No link path exists yet.** `tools/build.sh` (this repo)
+//      compiles every `src/*.pdx` to its own loose `.o` via
+//      `paideia-as build --emit elf64` and performs NO link step at
+//      all (see that script's own header comment) -- there is no
+//      `libpdx-gfx-satellite.a`, no vendoring, and no dependency-
+//      source resolution mechanism that would pull libpdx-gfx's /
+//      libpdx-font's `.pdx` sources (or a prebuilt archive of them)
+//      into this repo's build. `deps:` in manifest.pdxproj today
+//      records version floors only, not an actual fetch/link
+//      mechanism. Calling `gfx_fill_rect` by bare name would compile
+//      today (each `.pdx` compiles independently; an unresolved
+//      external symbol is only a link-time failure) but the resulting
+//      object could never actually run until a real link step AND a
+//      real libpdx-gfx-satellite.a exist in this repo's tree --
+//      exactly the "if satellite not in link path, keep stub" case.
+//   2. **Signature mismatch: SurfaceHandle vs. bare fb_ptr.** Every
+//      real libpdx-gfx entry point takes a `handle_va` pointing at a
+//      64-byte `SurfaceHandle` (pixels_va/width/height/pitch/cap_slot/
+//      damage_head/damage_len/damage_ptr -- libpdx-gfx's
+//      src/types.pdx), not this widget's bare `fb_ptr` +
+//      hardcoded-1024-byte-stride convention. Wiring the real call
+//      needs `Main::main` to mint (or synthesize) a real
+//      `SurfaceHandle` over `_pw_fb` first -- exactly pdxwatch#14's
+//      own step 5 ("retire `_pw_fb`, switch Main to a real
+//      KIND_SURFACE mint"), which is itself gated on this repo's own
+//      M1-002 widget-registry landing, not yet done.
+//   3. **Glyph geometry mismatch: 8x16 vs. this widget's 8x8.** The
+//      real `gfx_draw_glyph` blits a full 8x16 cell (libpdx-font's
+//      Font8x16 row table is 16 bytes/glyph -- confirmed against
+//      libpdx-font's actual `font_glyph_bitmap`, which returns exactly
+//      16 bytes). This widget's `PWC_BAR_ROW_PITCH` (10px) and label
+//      geometry assume an 8x8 cell; swapping to real glyphs without
+//      first reworking that geometry would visually overlap adjacent
+//      CPU rows. This is a real layout redesign, not the "mechanical
+//      rewrite" the original issue text estimated.
+//
+// Given all three, this landing keeps `pwc_gfx_fill_rect` /
+// `pwc_gfx_draw_glyph` functionally unchanged and instead records
+// this audit + the exact real signatures to wire against, so the
+// eventual retirement (once Main mints a real SurfaceHandle and the
+// row-pitch geometry is reworked for 8x16 glyphs) is a scoped,
+// reviewable follow-up rather than a rediscovery. Tracked as a
+// pdxwatch#14 follow-up issue at that point.
 //
 // =============================================================================
 // LOAD % DERIVATION (M1-era stopgap; sys_cpuinfo pending)
@@ -362,10 +421,11 @@ module WidgetCpu = structure {
   // ==========================================================================
   // pwc_gfx_fill_rect(fb_ptr, x, y, w, h, color) -> u64
   //
-  // STUB(libpdx-gfx.M2-002): inline BGRA8888 rect-fill primitive. When
-  // libpdx-gfx.M2-002 lands (`gfx_fill_rect(surf, x, y, w, h, color)`),
-  // this stub retires and the callsites below rewire to the library
-  // entry through the SurfaceHandle-carrying signature.
+  // STUB(libpdx-gfx.M2-002): inline BGRA8888 rect-fill primitive.
+  // libpdx-gfx.M2-002 HAS landed as of v1.0.0-src: real signature is
+  // `gfx_fill_rect(handle_va, x, y, w, h, color) -> u64` over a
+  // 64-byte SurfaceHandle (see this file's own pdxwatch#14 AUDIT
+  // note above for why this stub is not yet retired despite that).
   //
   // Contract:
   //   rdi = fb_ptr    VA of a BGRA8888 back-buffer, stride
@@ -459,9 +519,15 @@ module WidgetCpu = structure {
   // M2-001 stub semantics: fill the entire 8x8 cell with `fg`. This
   // makes the label region visible in a memory-dump / captured
   // framebuffer inspection during smoke witnessing without depending
-  // on the libpdx-font bitmap store. When libpdx-font.M2-001 lands,
-  // this stub retires and callsites rewire to `gfx_draw_glyph` through
-  // the library entry.
+  // on the libpdx-font bitmap store.
+  //
+  // BOTH prerequisites HAVE landed (libpdx-gfx v1.0.0-src's real
+  // `gfx_draw_glyph(handle_va, x, y, glyph_ptr, fg, bg)`; libpdx-font
+  // v0.6.0/v1.0.0-src's real `font_lookup_glyph(codepoint) ->
+  // glyph_id` + `font_glyph_bitmap(glyph_id, out_ptr, out_max)` --
+  // out_ptr receives a 16-byte row table, an 8x16 cell not this
+  // stub's 8x8). See this file's own pdxwatch#14 AUDIT note above for
+  // why this stub is not yet retired despite both landings existing.
   //
   // Contract identical to the eventual libpdx-gfx signature:
   //   rdi = fb_ptr, rsi = x, rdx = y, rcx = glyph, r8 = fg, r9 = bg

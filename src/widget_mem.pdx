@@ -24,14 +24,34 @@
 //
 // The R102 wave-ordering table names libpdx-gfx.M2-002 (gfx_fill_rect)
 // and libpdx-font.M2-001 (gfx_draw_glyph over the glyph store) as
-// prerequisites; neither library has landed in the pdxwatch link path
-// at this landing time. Rather than block the widget on the two
-// upstream landings, this module ships **minimal inline stubs**
+// prerequisites; neither library had landed in the pdxwatch link path
+// at THIS landing time. Rather than block the widget on the two
+// upstream landings, this module shipped **minimal inline stubs**
 // prefixed `pwm_gfx_*` (so a future wire-up round does not collide
 // on link with libpdx-gfx's real `gfx_*` symbols). The stubs are
-// byte-for-byte replicas of widget_cpu.pdx's `pwc_gfx_*` stubs --
-// the follow-up dependency issue (see file-level comment in
-// widget_cpu.pdx §STUB) covers both widgets together.
+// byte-for-byte replicas of widget_cpu.pdx's `pwc_gfx_*` stubs.
+//
+// =============================================================================
+// pdxwatch#14 AUDIT (this landing): real libraries exist, still not wired
+// =============================================================================
+//
+// See widget_cpu.pdx's own §pdxwatch#14 AUDIT header for the full
+// finding (verified against both libraries' actual shipped source):
+// libpdx-gfx v1.0.0-src ships real `gfx_fill_rect(handle_va, x, y, w,
+// h, color)` and `gfx_draw_glyph(handle_va, x, y, glyph_ptr, fg, bg)`;
+// libpdx-font v0.6.0/v1.0.0-src ships real `font_lookup_glyph
+// (codepoint) -> glyph_id` + `font_glyph_bitmap(glyph_id, out_ptr,
+// out_max)` (16-byte row table, an 8x16 cell). Both are real and
+// stable. This widget's `pwm_gfx_*` stubs are NOT retired this
+// landing for the same three reasons as widget_cpu.pdx's identical
+// stubs: (1) tools/build.sh has no link step and no dependency-source
+// resolution for libpdx-gfx/libpdx-font -- there is no
+// `libpdx-gfx-satellite.a` in this repo's tree; (2) the real API
+// needs a 64-byte SurfaceHandle this widget's bare `fb_ptr` +
+// hardcoded-1024-stride convention does not provide, pending Main
+// minting a real KIND_SURFACE; (3) the real glyph cell is 8x16, not
+// this widget's assumed 8x8, a layout change beyond a mechanical
+// stub swap. Tracked as a pdxwatch#14 follow-up once those land.
 //
 // =============================================================================
 // MEMORY-STAT SOURCE (M1-era proxy; sys_meminfo pending)
@@ -293,10 +313,11 @@ module WidgetMem = structure {
   // pwm_gfx_fill_rect(fb_ptr, x, y, w, h, color) -> u64
   //
   // STUB(libpdx-gfx.M2-002): inline BGRA8888 rect-fill primitive.
-  // Byte-for-byte replica of WidgetCpu::pwc_gfx_fill_rect. When
-  // libpdx-gfx.M2-002 lands (`gfx_fill_rect(surf, x, y, w, h, color)`),
-  // both this stub and pwc_gfx_fill_rect retire in one round and the
-  // callsites below rewire to the library entry.
+  // Byte-for-byte replica of WidgetCpu::pwc_gfx_fill_rect.
+  // libpdx-gfx.M2-002 HAS landed as of v1.0.0-src: real signature is
+  // `gfx_fill_rect(handle_va, x, y, w, h, color) -> u64` over a
+  // 64-byte SurfaceHandle (see this file's own pdxwatch#14 AUDIT note
+  // above for why this stub is not yet retired despite that).
   //
   // Contract: identical to pwc_gfx_fill_rect (see widget_cpu.pdx).
   //   rdi = fb_ptr, rsi = x, rdx = y, rcx = w, r8 = h, r9 = color
@@ -374,6 +395,14 @@ module WidgetMem = structure {
   // M2-002 stub semantics: fill the entire 8x8 cell with `fg`. Real
   // semantics (libpdx-gfx.M2-004): walk the GlyphRef bitmap for
   // `glyph`, write `fg` for set bits and `bg` for clear bits.
+  //
+  // BOTH prerequisites HAVE landed (libpdx-gfx v1.0.0-src's real
+  // `gfx_draw_glyph(handle_va, x, y, glyph_ptr, fg, bg)`; libpdx-font
+  // v0.6.0/v1.0.0-src's real `font_lookup_glyph(codepoint) ->
+  // glyph_id` + `font_glyph_bitmap(glyph_id, out_ptr, out_max)` --
+  // out_ptr receives a 16-byte row table, an 8x16 cell not this
+  // stub's 8x8). See this file's own pdxwatch#14 AUDIT note above for
+  // why this stub is not yet retired despite both landings existing.
   //
   // Contract identical to pwc_gfx_draw_glyph.
   //   rdi = fb_ptr, rsi = x, rdx = y, rcx = glyph, r8 = fg, r9 = bg

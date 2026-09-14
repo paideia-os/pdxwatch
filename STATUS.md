@@ -2,19 +2,24 @@
 
 **Wave:** R102 userland graphical stack -- reference apps
 **Current milestone:** M5-001 signed-release closer landed
-(pdxwatch#10) -- **v1.2.1 hotfix cut (pdxwatch#15; dual-sign pass
-still pending live keys per v1.2.0)**
-**Version:** 1.2.1 (v1.2.1 hotfix -- pdxwatch#15 widget_net.pdx
-`task_seen` unsigned-wrap fix; see `CHANGELOG.md` `[1.2.1]` and
-§"v1.2.1 hotfix landing details" below. Prior: M5-001 signed-release
-closer + M4 witness triplet. Version-name note: the M5-001 issue
-names "1.0.0" as the signed-release target, but the semver line
-advanced through v1.1-A/B/C (Track-C real-body + semantic-pipe wave)
-before this milestone landed. Semver monotonicity wins over the
-milestone name: v1.2.0 tagged that cut. The fingerprint identity
-`pdxwatch 1.0.0 signed ok` remains verbatim per the M5-001 witness
-contract -- see release/RELEASE-1.2.0.md §1 for the full
-reconciliation.)
+(pdxwatch#10) -- **v1.2.3 audit cut (pdxwatch#14; no functional
+change; dual-sign pass still pending live keys per v1.2.0)**
+**Version:** 1.2.3 (v1.2.3 audit -- pdxwatch#14 confirmed libpdx-gfx/
+libpdx-font's real APIs against their actual shipped source and
+documented why widget_cpu.pdx / widget_mem.pdx stub retirement stays
+deferred; see `CHANGELOG.md` `[1.2.3]`. Prior: v1.2.2 docs hotfix --
+pdxwatch#16 retracted fabricated smoke-driver grep-gate claims (no
+code change); see `CHANGELOG.md` `[1.2.2]`. Prior still: v1.2.1
+hotfix -- pdxwatch#15 widget_net.pdx `task_seen` unsigned-wrap fix;
+see `CHANGELOG.md` `[1.2.1]` and §"v1.2.1 hotfix landing details"
+below. Prior still: M5-001 signed-release closer + M4 witness triplet.
+Version-name note: the M5-001 issue names "1.0.0" as the
+signed-release target, but the semver line advanced through
+v1.1-A/B/C (Track-C real-body + semantic-pipe wave) before this
+milestone landed. Semver monotonicity wins over the milestone name:
+v1.2.0 tagged that cut. The fingerprint identity `pdxwatch 1.0.0
+signed ok` remains verbatim per the M5-001 witness contract -- see
+release/RELEASE-1.2.0.md §1 for the full reconciliation.)
 
 See [`paideia-os` monorepo `design/graphics/r102-user-plan.md`](https://github.com/paideia-os/paideia-os/blob/main/design/graphics/r102-user-plan.md)
 §2.8 (system-monitor GUI: role + data source + widget layout) and
@@ -298,21 +303,35 @@ signed release attests to).
 
 Follow-up hotfixes remaining open against v1.2.0:
 
-- pdxwatch#14 -- retire widget_cpu.pdx / widget_mem.pdx /
-  widget_net.pdx libpdx-gfx + libpdx-font inline stubs when
-  libpdx-gfx.M2-002 / libpdx-gfx.M2-003 / libpdx-font.M2-001
-  land. Target: v1.3.0.
+- pdxwatch#14 -- retire widget_cpu.pdx / widget_mem.pdx libpdx-gfx +
+  libpdx-font inline stubs. **Audited 2026-09-13 (v1.2.3): both
+  libraries HAVE landed real bodies (libpdx-gfx v1.0.0-src, libpdx-
+  font v0.6.0/v1.0.0-src), but retirement is still deferred -- see
+  CHANGELOG.md `[1.2.3]` for the three concrete blockers (no link
+  path in this repo yet, SurfaceHandle vs. bare fb_ptr mismatch, 8x16
+  vs. this widget pair's 8x8 glyph geometry).** Target: v1.3.0, once
+  Main mints a real KIND_SURFACE and the row-pitch geometry is
+  reworked for 8x16 glyphs.
 - pdxwatch#15 -- widget_net.pdx unsigned-wrap on `task_seen`
   decrease -> false MAX spike. **landed 2026-09-13 (v1.2.1 hotfix)**.
+- pdxwatch#16 -- retract fabricated smoke-driver grep-gate claims
+  (docs only). **landed 2026-09-13 (v1.2.2 docs hotfix)**.
 
 ## Post-v1.2.0 roadmap
 
 - **v1.2.1 (landed 2026-09-13)** -- pdxwatch#15 hotfix (widget_net
   unsigned-wrap). Single-file `src/widget_net.pdx` change; no
   manifest / caps.decl churn beyond the version bump.
-- **v1.3.0** -- pdxwatch#14 stub retirement (three widget modules'
-  inline gfx/font stubs), gated on the libpdx-gfx M2 + libpdx-font
-  M2 landings.
+- **v1.2.2 (landed 2026-09-13)** -- pdxwatch#16 docs hotfix (retract
+  fabricated smoke-driver grep-gate claims). No code change.
+- **v1.2.3 (landed 2026-09-13)** -- pdxwatch#14 audit (no functional
+  change): confirmed libpdx-gfx/libpdx-font's real APIs against their
+  actual shipped source and documented why stub retirement stays
+  deferred (see CHANGELOG.md `[1.2.3]`).
+- **v1.3.0** -- pdxwatch#14 stub retirement (widget_cpu.pdx /
+  widget_mem.pdx inline gfx/font stubs), gated on Main::main minting
+  a real KIND_SURFACE (SurfaceHandle) and an 8x16-glyph row-pitch
+  rework.
 - **v1.4.0** -- libpdx-event.M3-001 wire-in retires the
   `Input::input_poll_events` stub; unbounded main loop replaces
   the `PW_MAIN_TICK_BUDGET = 32` bounded shape.

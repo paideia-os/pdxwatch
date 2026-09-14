@@ -7,8 +7,34 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 
 ## [Unreleased]
 
-(Empty -- pdxwatch#14 stub retirement targets the next patch/minor
-release; see STATUS.md `Post-v1.2.0 roadmap`.)
+(Empty -- see `[1.2.3]` below for the pdxwatch#14 audit outcome.)
+
+## [1.2.3] - 2026-09-13
+
+Audit release. Addresses pdxwatch#14; no functional change.
+
+### Changed
+
+- **pdxwatch#14 -- libpdx-gfx/libpdx-font stub audit (retirement
+  deferred, not performed).** Confirmed against both libraries'
+  actual shipped source that libpdx-gfx v1.0.0-src ships real
+  `gfx_fill_rect(handle_va, x, y, w, h, color)` and `gfx_draw_glyph
+  (handle_va, x, y, glyph_ptr, fg, bg)`, and libpdx-font v0.6.0/
+  v1.0.0-src ships real `font_lookup_glyph(codepoint) -> glyph_id`
+  and `font_glyph_bitmap(glyph_id, out_ptr, out_max)`. `src/
+  widget_cpu.pdx`'s `pwc_gfx_fill_rect` / `pwc_gfx_draw_glyph` and
+  `src/widget_mem.pdx`'s `pwm_gfx_fill_rect` / `pwm_gfx_draw_glyph`
+  stubs are **kept unchanged** rather than retired, because: (1)
+  `tools/build.sh` has no link step and no dependency-source
+  resolution for libpdx-gfx/libpdx-font -- there is no
+  `libpdx-gfx-satellite.a` in this repo's link path today; (2) the
+  real API needs a 64-byte SurfaceHandle this repo's bare `fb_ptr` +
+  hardcoded-1024-byte-stride convention does not provide, pending
+  `Main::main` minting a real KIND_SURFACE; (3) the real glyph cell
+  is 8x16px, not this widget pair's assumed 8x8px, a layout change
+  beyond a mechanical stub swap. Both files' headers now cite the
+  exact real signatures for the eventual wire-up. Tracked as a
+  pdxwatch#14 follow-up once the blocking items above land.
 
 ## [1.2.2] - 2026-09-13
 
