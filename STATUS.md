@@ -277,9 +277,15 @@ signed release attests to).
   delegates to `paideia-release verify` and, on a successful
   dual-sig AND-verify, echoes `pdxwatch 1.0.0 signed ok` to stdout.
   Refuses fast (exit 3) when handed the source-form manifest to
-  prevent a false-green fingerprint over unsigned bytes. The QEMU
-  smoke driver grep-gates on the fingerprint alongside the peer
-  widget / input / M4-witness fingerprints.
+  prevent a false-green fingerprint over unsigned bytes.
+  **Corrected by pdxwatch#16:** this bullet originally claimed the
+  QEMU smoke driver grep-gates on the fingerprint alongside the peer
+  widget / input / M4-witness fingerprints. No such wiring exists in
+  the paideia-os monorepo -- pdxwatch is not registered under
+  `tools/user/` there, so its `SAT_APPS_R102` build/smoke loop never
+  invokes or greps this repo's output. The verify-witness is a
+  standalone, manually-invoked mechanism with no smoke-driver
+  consumer today; see `release/RELEASE-1.2.0.md` §10 (Corrections).
 - `CHANGELOG.md`: new `## [1.2.0] - 2026-09-11` section migrates
   the Unreleased entries (M4 witness triplet + M3-001 input
   dispatch) below the release header and adds the M5-001 release

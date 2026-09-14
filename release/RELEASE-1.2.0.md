@@ -245,10 +245,11 @@ Expected mirror layout after push:
 The fingerprint identity `pdxwatch 1.0.0 signed ok` is
 milestone-scoped (M5-001), not version-scoped — see §1. The
 verify-witness is the fingerprint mechanism this release ships
-in-tree; the QEMU smoke driver grep-gates on this string alongside
-the peer widget fingerprints (`pdxwatch cpu-widget ok`, `mem-widget
-ok`, `net-widget ok`, `input ok`, `seeded-stat ok`, `click-cycle
-ok`, `quit ok`).
+in-tree. **Correction (pdxwatch#16):** an earlier draft of this
+document claimed the paideia-os QEMU smoke driver grep-gates on this
+string alongside the peer widget fingerprints (`pdxwatch cpu-widget
+ok`, `mem-widget ok`, `net-widget ok`, `input ok`, `seeded-stat ok`,
+`click-cycle ok`, `quit ok`). That claim is false as shipped — see §10 (Corrections) below.
 
 **Step 8 — GitHub release.**
 
@@ -342,6 +343,40 @@ patch release.
   renamed at, since v2.0.0 first crosses the "user launches
   pdxwatch and sees a window" threshold the M5-001 name originally
   anticipated.
+
+## 10. Corrections
+
+**pdxwatch#16 (2026-09-13), discovered by the W45 retrospective
+debugger sweep.** This document (§5 Step 7), CHANGELOG.md's
+`[1.2.0]` entry, STATUS.md's M5-001 landing-details section, and
+`tools/release-verify.sh`'s header comment each stated as present-tense
+fact that "the paideia-os QEMU smoke driver grep-gates on the
+[`pdxwatch 1.0.0 signed ok`] fingerprint alongside the peer widget /
+input / M4-witness fingerprints." **That claim is false** as of this
+release:
+
+- `grep -n "signed ok\|pdxwatch" tools/run-smoke.sh` in the
+  paideia-os monorepo returns zero hits.
+- `tools/build.sh`'s `SAT_APPS_R102` loop only invokes a satellite's
+  own `tools/build.sh` if it finds one at `tools/user/<name>/tools/build.sh`
+  in the monorepo tree — pdxwatch does not exist anywhere under
+  `tools/user/` there.
+- No occurrence anywhere in the monorepo's `tools/*.sh` of any
+  pdxwatch fingerprint string, `pdxwatch 1.0.0 signed ok` included.
+
+The fingerprint literal itself (`pdxwatch 1.0.0 signed ok`) is
+correct per `design/graphics/r102-user-plan.md:1829` — only the claim
+that anything in-tree currently *consumes* it was fabricated. As
+shipped at v1.2.0 (and still at v1.2.1), the fingerprint has no
+smoke-driver consumer at all; `tools/release-verify.sh` is a
+standalone, manually-invoked witness. Wiring pdxwatch into the
+monorepo's satellite build/smoke loop is tracked as future work (see
+§9 Post-v1.2.0 roadmap) rather than claimed as already done.
+
+This section documents the retraction; the corrected present-tense
+text (both here and in CHANGELOG.md) now describes the
+verify-witness alone, without asserting a smoke-driver consumer that
+does not exist.
 
 ---
 

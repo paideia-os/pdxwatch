@@ -10,6 +10,33 @@ section per released tag, dated `YYYY-MM-DD`. Categories used:
 (Empty -- pdxwatch#14 stub retirement targets the next patch/minor
 release; see STATUS.md `Post-v1.2.0 roadmap`.)
 
+## [1.2.2] - 2026-09-13
+
+Docs hotfix. Closes pdxwatch#16.
+
+### Corrections
+
+- **pdxwatch#16 -- retract fabricated "smoke driver grep-gates on
+  fingerprint" claims.** CHANGELOG.md's own `[1.2.0]` entry (below),
+  `release/RELEASE-1.2.0.md` §5 Step 7, STATUS.md's M5-001
+  landing-details section, and `tools/release-verify.sh`'s header
+  comment each stated as present-tense fact that the paideia-os QEMU
+  smoke driver grep-gates on the `pdxwatch 1.0.0 signed ok`
+  fingerprint alongside the peer widget / input / M4-witness
+  fingerprints. **This was false**: `tools/run-smoke.sh` in the
+  paideia-os monorepo has zero references to this fingerprint or to
+  `pdxwatch` at all, and pdxwatch does not exist under `tools/user/`
+  in that monorepo, so its `SAT_APPS_R102` build/smoke loop never
+  invokes or greps this repo's output. The fingerprint literal itself
+  is correct (`design/graphics/r102-user-plan.md:1829`); only the
+  claim that anything in-tree consumes it was fabricated. All four
+  sites are corrected to describe the verify-witness as a standalone,
+  manually-invoked mechanism with no smoke-driver consumer today; see
+  `release/RELEASE-1.2.0.md` §10 (Corrections) for the full accounting.
+  Discovered by the W45 retrospective debugger sweep, 2026-09-11.
+  `manifest.pdxproj`: `version = 1.2.1` -> `version = 1.2.2`.
+  Closes #16.
+
 ## [1.2.1] - 2026-09-13
 
 Hotfix release. Closes pdxwatch#15.
@@ -90,9 +117,12 @@ remains verbatim per the M5-001 witness contract -- see
     source-form manifest to prevent a false-green fingerprint over
     unsigned bytes; refuses (exit 4) when `paideia-release` is
     absent from PATH so S2-blocked configurations do not silently
-    emit success. The paideia-os QEMU smoke driver grep-gates on
-    the fingerprint alongside the peer widget / input / M4-witness
-    fingerprints.
+    emit success. **Corrected by pdxwatch#16 (see the `[1.2.2]`
+    entry above):** this bullet originally claimed the paideia-os
+    QEMU smoke driver grep-gates on the fingerprint alongside the
+    peer widget / input / M4-witness fingerprints. No such wiring
+    exists in the monorepo -- the verify-witness is a standalone,
+    manually-invoked mechanism with no smoke-driver consumer today.
   - `manifest.pdxproj`: `version = 1.1.0` -> `version = 1.2.0`;
     the `release:` block gains `manifest_sig` /
     `release_note` / `verify_witness` entries pointing at the

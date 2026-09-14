@@ -5,10 +5,16 @@
 # dual-signature scheme (Ed25519 + ML-DSA-65, AND-semantics per
 # design/02-development-environment.md §1140). On all-pass, emits the
 # fingerprint identity `pdxwatch 1.0.0 signed ok` to stdout -- the
-# M5-001 witness string the paideia-os QEMU smoke driver grep-gates
-# on, alongside the peer widget fingerprints (`pdxwatch cpu-widget
-# ok`, `mem-widget ok`, `net-widget ok`, `input ok`, `seeded-stat
-# ok`, `click-cycle ok`, `quit ok`).
+# M5-001 witness string this repo reserves for that purpose.
+#
+# Correction (pdxwatch#16): an earlier version of this comment
+# claimed the paideia-os QEMU smoke driver grep-gates on this string
+# alongside the peer widget fingerprints (`pdxwatch cpu-widget ok`,
+# `mem-widget ok`, `net-widget ok`, `input ok`, `seeded-stat ok`,
+# `click-cycle ok`, `quit ok`). That is false as of this release --
+# no such wiring exists in the monorepo; this script is a standalone,
+# manually-invoked witness with no smoke-driver consumer today. See
+# release/RELEASE-1.2.0.md §10 (Corrections) for the full accounting.
 #
 # The fingerprint identity is MILESTONE-scoped (M5-001), not
 # VERSION-scoped -- see release/RELEASE-1.2.0.md §1 for the version-
